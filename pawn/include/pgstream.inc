@@ -1,17 +1,17 @@
 /*
  *  pgstream — native PostgreSQL plugin for SA:MP
- *  Version 0.3.1
+ *  Version 0.3.2
  *
  *  Features: TLS/SSL, Transactions, Listen/Notify, Prepared Statements,
- *            Parameterized Queries, Result API (index & name),
- *            Auto-Reconnect (supervisor keeps handles alive).
+ *            Parameterized Queries, printf-style QueryFormat (%d/%i/%f/%s/%c/%x/%X),
+ *            Result API (index & name), Auto-Reconnect (supervisor keeps handles alive).
  */
 #if defined _pgstream_included
 	#endinput
 #endif
 #define _pgstream_included
 
-#define PGSTREAM_VERSION 301
+#define PGSTREAM_VERSION 302
 
 // Plugin version info
 native PG_Version(dest[], size = sizeof(dest));
@@ -47,6 +47,13 @@ native PG_EscapeString(connection, const src[], dest[], size = sizeof(dest));
 // Formats: 'i'/'d' (int), 'f' (float), 's' (string), 'b' (bool), 'n' (null)
 // Parameters use $1, $2, ... placeholders
 native PG_AsyncQuery(connection, const query[], const callback[] = "", const format[] = "", {Float, _}:...);
+
+// printf-style formatter: specifiers %d/%i/%f/%s/%c/%x/%X in the query
+// become $1..$N parameter bindings (never string interpolation).
+// '%' inside SQL string literals ('...'), quoted identifiers ("..."), and
+// SQL comments is left untouched; %% is a literal percent.
+// varargs follow specifier order: %d/%i/%x/%X/%c = int cell, %f = float, %s = string.
+native PG_QueryFormat(connection, const query[], const callback[] = "", {Float, _}:...);
 
 // ---------------------------------------------------------------------------
 // Transactions

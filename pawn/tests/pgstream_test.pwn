@@ -1,8 +1,9 @@
 /*
- *  pgstream_test.pwn — Full Integration Test for PGStream v0.3.0
- *  Tests: TLS Connect, Query, Transactions, Listen/Notify, Prepared Statements,
+ *  pgstream_test.pwn — Full Integration Test for PGStream v0.3.2
+ *  Tests: TLS Connect, Query, QueryFormat (printf-style), Transactions,
+ *         Listen/Notify, Prepared Statements,
  *         Auto-Reconnect (backend self-terminate -> socket EOF -> plugin reconnect)
- *  Target: postgresql://neondb_owner:***@<db-host>/<dbname>?sslmode=require&channel_binding=require
+ *  Target: postgresql://owner:***@<db-host>/<dbname>?sslmode=require&channel_binding=require
  */
 #include <a_samp>
 #include <pgstream>
@@ -31,6 +32,8 @@ forward OnCleanup(connection, result, extra);
 forward OnFinalCheck(connection, result, extra);
 forward OnSelfKill(connection, result, extra);
 forward OnDropDone(connection, result, extra);
+forward OnFormatInsert(connection, result, extra);
+forward OnFormatQuery(connection, result, extra);
 forward CheckReconnect();
 
 main()
@@ -353,6 +356,22 @@ public OnFinalCheck(connection, result, extra)
 	printf("[PGStream] PASS: Total rows in pgstream_test: %s", cnt);
 	PG_FreeResult(result);
 
+	// Test 13b: QueryFormat INSERT (printf-Pawn style). `%d`/`%s` di query
+	// menjadi placeholder $N; '%escaped' di sini cuma ISI parameter (string),
+	// bukan specifier query — nilai tidak pernah masuk raw SQL (injection-safe).
+	print("[PGStream] TEST QueryFormat INSERT...");
+	PG_QueryFormat(g_conn,
+		"INSERT INTO pgstream_test (id, name, score) VALUES (%d, %s, %d)",
+		"OnFormatInsert", 2, "O'Reilly %escaped", 777
+	);
+	return 1;
+}
+
+public OnFormatInsert(connection, result, extra)
+{
+	printf("[PGStream] PASS FORMAT-INSERT: affected=%d", PG_GetAffectedRows(result));
+	PG_FreeResult(result);
+
 	// T7: Prepare sel_count sebelum self-kill — supervisor akan re-prepare ulang
 	// statement ini setelah reconnect (restore session), jadi statement hidup lagi.
 	PG_Prepare(g_conn, "sel_count", "SELECT COUNT(*) AS cnt FROM pgstream_test", "OnPreparedReady");
@@ -390,6 +409,25 @@ public OnRestoredPrepared(connection, result, extra)
 	new cnt[16];
 	PG_GetStringByName(result, 0, "cnt", cnt, sizeof(cnt));
 	printf("[PGStream] PASS RESTORE-PREPARED: rows=%d cnt=%s", rows, cnt);
+	PG_FreeResult(result);
+
+	// Test 13c: QueryFormat SELECT setelah reconnect — verifikasi baris yang
+	// diinsert di fase 13b dan menekankan literal `%` di dalam nilai tetap aman.
+	print("[PGStream] TEST QueryFormat SELECT after reconnect...");
+	PG_QueryFormat(connection,
+		"SELECT id, name FROM pgstream_test WHERE id = %d AND name = %s",
+		"OnFormatQuery", 2, "O'Reilly %escaped"
+	);
+	return 1;
+}
+
+public OnFormatQuery(connection, result, extra)
+{
+	new rows = PG_NumRows(result);
+	new id = PG_GetIntByName(result, 0, "id");
+	new name[64];
+	PG_GetStringByName(result, 0, "name", name, sizeof(name));
+	printf("[PGStream] PASS FORMAT-QUERY: rows=%d id=%d name='%s'", rows, id, name);
 	PG_FreeResult(result);
 
 	// T7: DROP dipindah ke sini, setelah restore test selesai (urut).

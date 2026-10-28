@@ -1,4 +1,4 @@
-# PGStream API Reference (v0.3.1)
+# PGStream API Reference (v0.3.2)
 
 Semua native dideklarasikan di `pawn/include/pgstream.inc`. Versi plugin yang bisa dicek runtime: `PGSTREAM_VERSION` = `300`, string versi via `PG_Version`.
 
@@ -22,7 +22,7 @@ Parameter query memakai placeholder PostgreSQL `$1, $2, ...` sesuai urutan kode 
 native PG_Version(dest[], size = sizeof(dest));
 ```
 
-Mengisi `dest` dengan teks versi plugin (mis. `"PGStream 0.3.1"`) dan me-return kode versi integer (`301` untuk v0.3.1).
+Mengisi `dest` dengan teks versi plugin (mis. `"PGStream 0.3.2"`) dan me-return kode versi integer (`302` untuk v0.3.2).
 
 ```pawn
 new version[64];
@@ -177,6 +177,36 @@ PG_AsyncQuery(g_conn,
 ```
 
 Catatan error: kalau query gagal SQL-nya, callback tetap terpanggil dengan `result` yang berisi error — teks error ada di `result.error` (internal); `PG_GetError` tidak menampilkan error level query. Selalu panggil `PG_FreeResult(result)` setelah selesai membaca.
+
+## PG_QueryFormat
+
+```pawn
+native PG_QueryFormat(connection, const query[], const callback[] = "", {Float, _}:...);
+```
+
+printf-style formatter gaya Pawn untuk query — tanpa format string terpisah; argumen mengikuti urutan specifier di query:
+
+- Callback signature: sama seperti `PG_AsyncQuery` (`forward <name>(connection, result, extra);`).
+- Konversi: `%d`/`%i` → int, `%f` → float, `%s` → string, `%c` → karakter dari cell, `%x`/`%X` → string hex (`ff`/`FF`), `%%` → `%` literal. Setiap specifier efektif menjadi `$1..$N` + binding typed (`SqlParam`) — nilai tidak pernah dimasukkan ke teks SQL, jadi input (`O'Reilly`, `'; DROP TABLE x;--`, unicode/emoji) aman dari SQL injection tanpa escaping manual.
+- `%` di dalam string literal SQL (`'...'`, escape `''`), identifier quoted (`"..."`), dan komentar (`--`, `/* */`) **tidak dikonversi** — contoh `LIKE '%x%'` tetap utuh. Pakai `$1` + `PG_AsyncQuery` bila pattern-nya dinamis.
+- Specifier lain (`%q`, `%e`, `%g`, width/flags) → error `unsupported format specifier '%x'`; vararg kurang/lebih → `format specifier count mismatch (expected N, got M)`. Bila callback disediakan, callback terpanggil dengan `result=0`; query tidak dieksekusi.
+
+Perbedaan tiga mekanisme:
+
+| Mekanisme | Sintaks di query | Nilai dari | Binding |
+|---|---|---|---|
+| Formatter Pawn (`PG_QueryFormat`) | `%d`, `%s`, ... | varargs urut | parameterized (`$N` typed) |
+| Placeholder SQL (`PG_AsyncQuery`) | `$1`, `$2`, ... | varargs via `format[]` (`'sib'`) | parameterized typed |
+| Interpolasi string (dihindari) | `'%s'` dijahit manual | — | raw rentan injection — plugin tidak menyediakan |
+
+```pawn
+forward OnFormatInsert(connection, result, extra);
+PG_QueryFormat(g_conn,
+    "INSERT INTO pgstream_test (id, name, score) VALUES (%d, %s, %d)",
+    "OnFormatInsert", 2, "O'Reilly %creature", 777
+);
+PG_FreeResult(result);
+```
 
 ## PG_Begin / PG_Commit / PG_Rollback
 

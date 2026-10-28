@@ -1,5 +1,20 @@
 # CHANGELOG — PGStream
 
+## [0.3.2] — 2026-10-28
+
+### Ditambahkan
+
+- **`PG_QueryFormat`** — printf-style formatter khusus Pawn/SA:MP: specifier `%d`/`%i` (int), `%f` (float), `%s` (string), `%c` (karakter dari cell), `%x`/`%X` (hex string) di dalam query dikonversi menjadi placeholder `$1..$N` dan parameter binding typed (`SqlParam`) — **bukan interpolasi string**, jadi input berbahaya (`O'Reilly`, `'; DROP TABLE x;--`, unicode) tetap terikat sebagai nilai.
+- `%%` di dalam query jadi `%` literal.
+- 14 unit test baru di `tests/sqlformat_tests.rs` + fase e2e `PASS FORMAT-INSERT`/`PASS FORMAT-QUERY` (termasuk string ber-kutip dan payload `%`).
+
+### Perilaku parser
+
+- `%` di dalam **string literal SQL** (`'...'`, escape `''`), **identifier quoted** (`"..."`), dan **komentar** (`--`, `/* */`) tidak dikonversi — tetap utuh. Contoh: `LIKE '%x%'` aman.
+- Specifier lain (`%q`, `%e`, `%g`, width/flags `%+.2d`, dst.) → error `unsupported format specifier`.
+- Jumlah vararg ≠ jumlah specifier → error `format specifier count mismatch (expected N, got M)`; query tidak dijalankan, callback (bila ada) dipanggil dengan `success=0`.
+- Versi: `PGSTREAM_VERSION` 301 → 302; `PG_Version()` → `"PGStream 0.3.2"`.
+
 ## [0.3.1] — 2026-10-28
 
 ### Diperbaiki

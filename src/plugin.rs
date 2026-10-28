@@ -11,6 +11,7 @@ use crate::abi::amx::{self, Amx, Cell};
 use crate::abi::callbacks;
 use crate::config;
 use crate::database::connection::{ConnectionStatus, PgConnection};
+use crate::database::format::{self, FormatArgKind};
 use crate::database::parameters::SqlParam;
 use crate::database::result::QueryResult;
 use crate::handles::{self, CONNECTIONS, RESULTS};
@@ -44,8 +45,8 @@ pub fn logprintf(msg: &str) {
     }
 }
 
-pub const VERSION_CODE: Cell = 301;
-pub const VERSION_TEXT: &str = "PGStream 0.3.1";
+pub const VERSION_CODE: Cell = 302;
+pub const VERSION_TEXT: &str = "PGStream 0.3.2";
 
 // ---------------------------------------------------------------------------
 // TLS
@@ -387,6 +388,9 @@ async fn execute_query_internal<T: tokio_postgres::ToStatement + Sync + ?Sized>(
                     }
                     data_rows.push(r);
                 }
+                // shortcut: rows_affected mirrors data-row count (0 for
+                // INSERT without RETURNING) — track CommandComplete when
+                // tokio_postgres exposes affected rows from query().
                 let len = data_rows.len() as u64;
                 QueryResult::new(cols, data_rows, len)
             }
@@ -443,7 +447,7 @@ fn escape_identifier(s: &str) -> String {
 // Native Callbacks Table
 // ---------------------------------------------------------------------------
 
-static PG_NATIVES: [amx::NativeInfo; 29] = [
+static PG_NATIVES: [amx::NativeInfo; 30] = [
     amx::NativeInfo {
         name: b"PG_Version\0".as_ptr() as *const c_char,
         func: Some(pg_version),
@@ -467,6 +471,10 @@ static PG_NATIVES: [amx::NativeInfo; 29] = [
     amx::NativeInfo {
         name: b"PG_AsyncQuery\0".as_ptr() as *const c_char,
         func: Some(pg_async_query),
+    },
+    amx::NativeInfo {
+        name: b"PG_QueryFormat\0".as_ptr() as *const c_char,
+        func: Some(pg_query_format),
     },
     amx::NativeInfo {
         name: b"PG_NumRows\0".as_ptr() as *const c_char,
@@ -1178,6 +1186,112 @@ unsafe extern "C" fn pg_async_query(amx_ptr: *mut Amx, params: *mut Cell) -> Cel
     runtime::spawn(async move {
         let lock = client.lock().await;
         let res = execute_query_internal(&lock, &query_str, &sql_params).await;
+        {
+            let mut results = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+            results.insert(result_id, res);
+        }
+        runtime::send_completion(CompletionEvent::QueryFinished {
+            conn_id,
+            result_id,
+            callback,
+            extra: 0,
+        });
+    });
+
+    result_id
+}
+
+/// Format conversion failed: set last_error on the handle, log, and fire the
+/// callback with success=0 (same contract as `reject_unavailable`). Nothing
+/// was sent to the database, so no query ever runs on a bad format.
+fn reject_bad_format(conn_id: i32, msg: &str, callback: &str) {
+    {
+        let mut conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = conns.get_mut(&conn_id) {
+            c.last_error = Some(msg.to_string());
+        }
+    }
+    logprintf(&format!(
+        "[PGStream] QueryFormat error on conn {}: {}",
+        conn_id, msg
+    ));
+    if !callback.is_empty() {
+        runtime::send_completion(CompletionEvent::CommandFinished {
+            conn_id,
+            success: false,
+            callback: callback.to_string(),
+        });
+    }
+}
+
+/// native PG_QueryFormat(connection, const query[], const callback[] = "", {Float, _}:...);
+///
+/// Query printf-Pawn style: `%d %i %f %s %c %x %X %%` become `$N` placeholders
+/// with typed parameter binding. There is no format[] argument — the kinds are
+/// determined by the specifiers themselves.
+unsafe extern "C" fn pg_query_format(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
+    let Some(conn_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
+    let query_str = read_string_arg(amx_ptr, params, 2).unwrap_or_default();
+    let callback = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
+
+    // Scan first: the kinds come from the specifiers themselves.
+    let (_, kinds) = match format::scan_specifiers(&query_str) {
+        Ok(scan) => scan,
+        Err(msg) => {
+            reject_bad_format(conn_id, &msg, &callback);
+            return 0;
+        }
+    };
+
+    // Read one Pawn vararg per specifier, in specifier order. Varargs are
+    // pushed as addresses (deref needed) except strings, same as
+    // parse_variadic_params — shortcut: pawncc 3.2.3664 ABI.
+    let get_addr = table_fn::<amx::AmxGetAddrFn>(amx::slot::GET_ADDR);
+    let Some(get_addr) = get_addr else {
+        reject_bad_format(conn_id, "AMX address table unavailable", &callback);
+        return 0;
+    };
+    let mut raw_args: Vec<SqlParam> = Vec::with_capacity(kinds.len());
+    for (idx, kind) in kinds.iter().enumerate() {
+        let arg_idx = 4 + idx as Cell;
+        let value = match kind {
+            FormatArgKind::Str => {
+                SqlParam::String(read_string_arg(amx_ptr, params, arg_idx).unwrap_or_default())
+            }
+            _ => {
+                let addr = amx::native_arg(params, arg_idx).unwrap_or(0);
+                let cell = deref_vararg_cell(amx_ptr, addr, get_addr);
+                match kind {
+                    FormatArgKind::Float => SqlParam::Float(f32::from_bits(cell as u32) as f64),
+                    // Int, Char and Hex all read a raw int cell here; the
+                    // conversion to String happens inside convert_pawn_format.
+                    _ => SqlParam::Int(cell),
+                }
+            }
+        };
+        raw_args.push(value);
+    }
+
+    let Some(client) = get_client_arc(conn_id) else {
+        reject_unavailable(conn_id, "QueryFormat", callback);
+        return 0;
+    };
+
+    let (new_sql, sql_params) = match format::convert_pawn_format(&query_str, &raw_args) {
+        Ok(converted) => converted,
+        Err(msg) => {
+            reject_bad_format(conn_id, &msg, &callback);
+            return 0;
+        }
+    };
+
+    let result_id = handles::next_result_id();
+
+    runtime::spawn(async move {
+        let lock = client.lock().await;
+        let res = execute_query_internal(&lock, &new_sql, &sql_params).await;
         {
             let mut results = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
             results.insert(result_id, res);

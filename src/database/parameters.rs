@@ -2,7 +2,7 @@ use bytes::BytesMut;
 use std::error::Error;
 use tokio_postgres::types::{to_sql_checked, IsNull, ToSql, Type};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SqlParam {
     Int(i32),
     Float(f64),

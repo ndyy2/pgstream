@@ -125,6 +125,8 @@ OK=1
 grep -qF "PASS: TLS connection established" "$LOG" || OK=0
 grep -qF "PASS: Inserted" "$LOG" || OK=0
 grep -qF "PASS RECONNECT" "$LOG" || OK=0
+grep -qF "PASS FORMAT-INSERT" "$LOG" || OK=0
+grep -qF "PASS FORMAT-QUERY" "$LOG" || OK=0
 grep -qF "=== ALL INTEGRATION TESTS COMPLETED ===" "$LOG" || OK=0
 if grep -qF "FAIL" "$LOG"; then OK=0; fi
 

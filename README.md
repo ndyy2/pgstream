@@ -1,6 +1,6 @@
 # PGStream
 
-Plugin PostgreSQL native untuk SA:MP, ditulis dalam Rust. **Versi 0.3.1** (auto-reconnect + keepalive; di atas 0.2.x hardening TLS, v0.1.0 awal M0).
+Plugin PostgreSQL native untuk SA:MP, ditulis dalam Rust. **Versi 0.3.2** (auto-reconnect + keepalive + printf-style `PG_QueryFormat`; di atas 0.2.x hardening TLS, v0.1.0 awal M0).
 
 - Target: Windows x86 32-bit (`cdylib`), output `pgstream.dll` (PE32).
 - Koneksi via `tokio-postgres` + `rustls` — tanpa dependensi libpq.
