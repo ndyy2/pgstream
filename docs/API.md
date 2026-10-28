@@ -1,6 +1,6 @@
-# PGStream API Reference (v0.2.0)
+# PGStream API Reference (v0.3.0)
 
-Semua native dideklarasikan di `pawn/include/pgstream.inc`. Versi plugin yang bisa dicek runtime: `PGSTREAM_VERSION` = `200`, string versi via `PG_Version`.
+Semua native dideklarasikan di `pawn/include/pgstream.inc`. Versi plugin yang bisa dicek runtime: `PGSTREAM_VERSION` = `300`, string versi via `PG_Version`.
 
 Format string umum (dipakai `PG_AsyncQuery` dan `PG_ExecutePrepared`):
 
@@ -22,7 +22,7 @@ Parameter query memakai placeholder PostgreSQL `$1, $2, ...` sesuai urutan kode 
 native PG_Version(dest[], size = sizeof(dest));
 ```
 
-Mengisi `dest` dengan teks versi plugin (mis. `"PGStream 0.2.0"`) dan me-return kode versi integer (`200` untuk v0.2.0).
+Mengisi `dest` dengan teks versi plugin (mis. `"PGStream 0.3.0"`) dan me-return kode versi integer (`300` untuk v0.3.0).
 
 ```pawn
 new version[64];
@@ -42,10 +42,18 @@ Koneksi dengan parameter individual (bentuk key-value). Perilaku TLS ditentukan 
 - `sslmode=require` / `prefer` — terenkripsi **tanpa** verifikasi sertifikat (rawan MITM); plugin memlog warning sekali per koneksi. Produksi wajib `verify-full`.
 - `sslmode=disable` — tanpa TLS.
 
-Return connection handle (integer ≥ 0) atau `-1` saat gagal menyiapkan koneksi. Hasil koneksi sebenarnya dikirim ke `callback` (async):
+Return connection handle (integer ≥ 1). Koneksi sebenarnya async; hasilnya dikirim ke `callback`. Auto-reconnect aktif untuk handle ini (bisa dimatikan via `database.reconnect_enabled`).
 
-- Callback signature: `forward <name>(connection, bool:success);`
-- Pada `success=false`, ambi detail lewat `PG_GetError`.
+### Kontrak callback (multi-shot)
+
+Callback signature: `forward <name>(connection, bool:success);`
+
+Karena supervisor auto-reconnect menjaga handle, callback **dipanggil lebih dari sekali**:
+
+- `success=1` — setiap kali koneksi (re)berhasil. Terjadi juga setelah reconnect otomatis; gunakan momen ini untuk re-sync state aplikasi (reload cache, set ulang state sesi, dll).
+- `success=0` — **tepat 1× per outage**: connect gagal di awal, atau koneksi yang sudah hidup mati (socket EOF / keepalive gagal). Tidak dipanggil ulang untuk setiap percobaan retry selama outage yang sama. Baca alasan via `PG_GetError`.
+
+`PG_Prepare`/`PG_Listen` yang sudah pernah sukses tidak perlu dipanggil lagi setelah reconnect — keduanya di-restore otomatis.
 
 ```pawn
 forward OnDBConnect(connection, bool:success);
@@ -84,6 +92,8 @@ public OnGameModeInit()
 
 Catatan error: jika URL tidak bisa diparse, koneksi gagal dan error dapat dibaca di callback via `PG_GetError`.
 
+Kontrak callback identik dengan `PG_Connect`: `success=1` setiap koneksi (re)berhasil (termasuk setelah reconnect otomatis), `success=0` tepat 1× per outage. Handle yang dikembalikan juga dijaga supervisor auto-reconnect.
+
 ## PG_Close
 
 ```pawn
@@ -92,13 +102,20 @@ native PG_Close(connection);
 
 Tutup koneksi handle dan bebaskan resource terkait. Setelah close, `PG_IsConnected` return `false`.
 
+`PG_Close` juga **menghentikan supervisor auto-reconnect** untuk handle tersebut: handle dihapus dari registry, sehingga supervisor tidak lagi mencoba connect ulang dan callback connect tidak dipanggil lagi untuk handle itu. Supervisor memeriksa handle yang hilang tiap detik saat idle; percobaan connect yang sedang berjalan diselesaikan lebih dulu sebelum supervisor berhenti.
+
 ## PG_IsConnected
 
 ```pawn
 native bool:PG_IsConnected(connection);
 ```
 
-Return `true` jika koneksi handle masih hidup.
+Return `true` hanya bila koneksi benar-benar hidup.
+
+- `false` saat handle sedang `Connecting` (auto-reconnect berjalan), `Failed` (outage dengan `database.reconnect_enabled = false`), `Disconnected`, atau handle sudah ditutup.
+- Sejak v0.3.0 socket EOF/error langsung mengubah status, jadi `PG_IsConnected` tidak lagi melaporkan `Connected` untuk koneksi yang sudah tertutup.
+
+Selama handle sedang reconnecting (status `Connecting`), native `PG_AsyncQuery`/`PG_ExecutePrepared`/`PG_Begin`/`PG_Commit`/`PG_Rollback`/`PG_Listen`/`PG_Prepare` pada handle tersebut **mengembalikan `0` tanpa memanggil callback**: client tidak ada di registry, jadi perintahnya tidak dieksekusi sama sekali. Gamemode yang menunggu callback akan diam selama outage (bisa menit) — tunda query hingga callback connect `success=1` terpanggil kembali. Tidak ada antrean query otomatis selama reconnect.
 
 ## PG_GetError
 
@@ -106,12 +123,17 @@ Return `true` jika koneksi handle masih hidup.
 native PG_GetError(connection, dest[], size = sizeof(dest));
 ```
 
-Mengisi `dest` dengan pesan error terakhir untuk koneksi. Dipanggil dari callback ketika `success=false`, atau query error.
+Mengisi `dest` dengan pesan error terakhir untuk koneksi: alasan kegagalan connect, alasan outage terakhir (mis. socket EOF dari server/pooler), atau error server dari `PG_Prepare`. Dipanggil dari callback ketika `success=0`, atau query error.
+
+Setelah koneksi (re)berhasil, pesan error dibersihkan — `PG_GetError` mengembalikan string kosong. Jadi selama outage, `PG_GetError` berisi alasan outage; begitu reconnect sukses, isinya kosong.
 
 ### Error umum
 
 - **`Max connections reached (N)`** — `N` = `pool.max_size` di `pgstream.toml`. Terjadi saat jumlah koneksi aktif (`Connecting`/`Connected`) sudah mencapai batas; koneksi baru ditolak (callback koneksi terpanggil dengan `success=0`; error terbaca via `PG_GetError`). Catatan: `max_size` adalah batas koneksi hidup, bukan ukuran pool idle.
 - **`Query timed out after Ns`** — `N` = `database.query_timeout_seconds`. Query melebihi timeout; callback query tetap terpanggil dengan `result` berisi error (teks error ada di `result.error` internal — belum ada native untuk membacanya; `PG_GetError` hanya menampilkan error level koneksi). Tetap panggil `PG_FreeResult(result)`.
+- **`Connection lost`** — log server saat socket mati: `[PGStream] Connection lost (conn N): <alasan> — reconnecting in Ns`. `<alasan>` diisi ke `PG_GetError` selama outage (contoh: `connection closed by server` saat server/pooler menutup socket, atau teks error socket). Supervisor lalu connect ulang dengan backoff 1s → 2s → 4s → … → cap `reconnect_max_delay_seconds` (default 30s).
+- **`reconnect disabled`** — akhir log `Connection lost` bila `database.reconnect_enabled = false`: tidak ada percobaan connect ulang, status handle menjadi `Failed` dan `PG_IsConnected` tetap `false`. `PG_GetError` tetap berisi alasan outage.
+- **`Keepalive probe failed on conn N (x): <alasan>`** — log server saat probe keepalive `SELECT 1` gagal (interval `database.keepalive_interval_seconds`, timeout `database.query_timeout_seconds`, default 15). Penghitung kegagalan harus mencapai **2 kegagalan berturut-turut** (`probe_failures >= 2`) sebelum koneksi dianggap mati → log `Connection lost` → supervisor reconnect; kegagalan pertama saja tidak memicu reconnect, dan probe sukses mengembalikan penghitung ke 0. Probe yang di-skip karena client sedang digunakan query lain tidak menimbulkan error — percobaan berikutnya baru 1 interval keepalive lagi.
 - Koneksi yang melebihi `database.connect_timeout_seconds` gagal; detailnya terbaca via `PG_GetError` di callback koneksi.
 
 ## PG_EscapeString
@@ -139,6 +161,8 @@ Eksekusi query async, hasil ke callback:
 - Callback signature: `forward <name>(connection, result, extra);`
 
 `extra` menerima nilai yang di-set saat invoke pertama; untuk query varargs sederhana pass `""`. Query bisa parameterized lewat `$1, $2, ...` plus format varargs.
+
+Satu statement per panggilan: string yang berisi beberapa statement (mis. `"INSERT ...; UPDATE ..."`) berbalik error dan tidak dieksekusi.
 
 ```pawn
 forward OnTestQuery(connection, result, extra);
@@ -189,6 +213,8 @@ Callback opsional (listened sukses/gagal):
 
 - `forward <name>(connection, bool:success);`
 
+Setelah reconnect, channel ini **di-issue ulang otomatis** oleh supervisor (`LISTEN <channel>`) — gamemode tidak perlu memanggil `PG_Listen` lagi. Kegagalan re-LISTEN hanya di-log server. Callback connect `success=1` tetap dipanggil setelah reconnect agak gamemode bisa re-sync hal lain.
+
 ```pawn
 forward OnListenReady(connection, bool:success);
 PG_Listen(g_conn, "pgstream_events", "OnListenReady");
@@ -218,6 +244,8 @@ Simpan prepared statement dengan nama tantangan. Callback signature:
 - `forward <name>(connection, bool:success);`
 
 Pada gagal, `PG_GetError` memuat server error prepared statement.
+
+Setelah reconnect, statement ini **di-prepare ulang otomatis** oleh supervisor (SQL disimpan per nama statement) — gamemode tidak perlu memanggil `PG_Prepare` lagi. Kalau re-prepare gagal (mis. tabel yang di-query sudah tidak ada), kegagalannya hanya di-log server dan statement tersebut tidak tersedia untuk `PG_ExecutePrepared` sampai gamemode mempersiapkannya ulang.
 
 ```pawn
 forward OnPrepared(connection, bool:success);

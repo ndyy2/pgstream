@@ -46,6 +46,17 @@ pub struct DatabaseConfig {
     /// negotiated (encrypted), only `verify-ca`/`verify-full` verify the cert.
     #[serde(default = "default_sslmode")]
     pub sslmode: String,
+    /// When true, a supervisor task tries to restore the connection after the
+    /// socket dies (BUG A: stale `Connected` status on idle disconnects).
+    #[serde(default = "default_reconnect_enabled")]
+    pub reconnect_enabled: bool,
+    /// Ceiling for the exponential reconnect backoff (starts at 1s, doubles).
+    #[serde(default = "default_reconnect_max_delay")]
+    pub reconnect_max_delay_seconds: u64,
+    /// Interval for `SELECT 1` probes that keep pooled/idle sockets alive.
+    /// 0 disables the probes.
+    #[serde(default = "default_keepalive_interval")]
+    pub keepalive_interval_seconds: u64,
 }
 
 fn default_connect_timeout() -> u64 {
@@ -56,6 +67,24 @@ fn default_query_timeout() -> u64 {
 }
 fn default_sslmode() -> String {
     "require".into()
+}
+fn default_reconnect_enabled() -> bool {
+    true
+}
+fn default_reconnect_max_delay() -> u64 {
+    30
+}
+fn default_keepalive_interval() -> u64 {
+    60
+}
+
+/// Exponential reconnect backoff: doubles `current`, capped at `max`.
+/// `max` is clamped to >=1s so a `reconnect_max_delay_seconds = 0` config
+/// cannot turn retries into a busy loop.
+pub fn next_backoff(current: Duration, max: Duration) -> Duration {
+    let max = max.max(Duration::from_secs(1));
+    let doubled = current.checked_mul(2).unwrap_or(max);
+    doubled.min(max)
 }
 
 impl Default for DatabaseConfig {
@@ -69,6 +98,9 @@ impl Default for DatabaseConfig {
             password_env: None,
             connect_timeout_seconds: 5,
             query_timeout_seconds: 15,
+            reconnect_enabled: default_reconnect_enabled(),
+            reconnect_max_delay_seconds: default_reconnect_max_delay(),
+            keepalive_interval_seconds: default_keepalive_interval(),
             sslmode: default_sslmode(),
         }
     }
@@ -287,4 +319,20 @@ pub fn max_connections() -> usize {
 /// Configured default `sslmode` for key-value connects.
 pub fn default_sslmode_value() -> String {
     CONFIG.lock().unwrap().database.sslmode.clone()
+}
+
+/// Auto-reconnect enabled (default true).
+pub fn reconnect_enabled() -> bool {
+    CONFIG.lock().unwrap().database.reconnect_enabled
+}
+
+/// Ceiling of the reconnect backoff (default 30s; clamped to >=1s).
+pub fn reconnect_max_delay() -> Duration {
+    Duration::from_secs(CONFIG.lock().unwrap().database.reconnect_max_delay_seconds)
+        .max(Duration::from_secs(1))
+}
+
+/// Keepalive probe interval (default 60s, 0 disables probes).
+pub fn keepalive_interval() -> Duration {
+    Duration::from_secs(CONFIG.lock().unwrap().database.keepalive_interval_seconds)
 }

@@ -1,6 +1,6 @@
 # PGStream
 
-Plugin PostgreSQL native untuk SA:MP, ditulis dalam Rust. **Versi 0.2.1** (patch hardening di atas 0.2.0; v0.1.0 awal, M0).
+Plugin PostgreSQL native untuk SA:MP, ditulis dalam Rust. **Versi 0.3.0** (auto-reconnect + keepalive; di atas 0.2.x hardening TLS, v0.1.0 awal M0).
 
 - Target: Windows x86 32-bit (`cdylib`), output `pgstream.dll` (PE32).
 - Koneksi via `tokio-postgres` + `rustls` — tanpa dependensi libpq.
@@ -14,18 +14,21 @@ Plugin PostgreSQL native untuk SA:MP, ditulis dalam Rust. **Versi 0.2.1** (patch
 3. [Build](#build)
 4. [Deploy ke server SA:MP](#deploy-ke-server-samp)
 5. [Konfigurasi pgstream.toml](#konfigurasi-pgstreamtoml)
-6. [Kompilasi Pawn](#kompilasi-pawn)
-7. [Catatan ABI varargs (pawncc 3.2.3664)](#catatan-abi-varargs-pawncc-323664)
-8. [Arsitektur](#arsitektur)
-9. [Testing](#testing)
-10. [CI & Release](#ci--release)
-11. [Batasan yang diketahui](#batasan-yang-diketahui)
-12. [Verified against](#verified-against)
+6. [Auto-reconnect & keepalive](#auto-reconnect--keepalive)
+7. [Kompilasi Pawn](#kompilasi-pawn)
+8. [Catatan ABI varargs (pawncc 3.2.3664)](#catatan-abi-varargs-pawncc-323664)
+9. [Arsitektur](#arsitektur)
+10. [Testing](#testing)
+11. [CI & Release](#ci--release)
+12. [Batasan yang diketahui](#batasan-yang-diketahui)
+13. [Verified against](#verified-against)
 
 ## Fitur
 
 - **Zero-dependency**: tidak butuh libpq; protokol PostgreSQL murni Rust (`tokio-postgres`, `rustls`).
 - **Asynchronous**: query jalan di tokio runtime background; game loop tidak pernah blocking.
+- **Auto-reconnect**: supervisor per handle mendeteksi socket mati (EOF, keepalive) lalu connect ulang dengan backoff eksponensial; prepared statement & `LISTEN` di-restore otomatis. Lihat [Auto-reconnect & keepalive](#auto-reconnect--keepalive).
+- **Keepalive**: probe `SELECT 1` periodik mendeteksi koneksi half-open (mis. pooler menutup koneksi idle).
 - **TLS/SSL** di kedua jalur koneksi: `PG_ConnectUrl` (parameter `sslmode=` di URL) dan `PG_Connect` (field `sslmode` di `pgstream.toml`, default `require`). Mode: `disable`, `prefer`, `require`, `verify-ca`, `verify-full`. Teruji dari `pawn/tests/pgstream_test.pwn` ke Neon managed Postgres. Lihat [TLS / sslmode](#tls--sslmode) — produksi wajib `verify-full`.
 - **Transaksi**: `PG_Begin` / `PG_Commit` / `PG_Rollback`.
 - **LISTEN/NOTIFY**: pub/sub antipoll — `PG_Listen` / `PG_Notify`, callback global `OnPGNotify`.
@@ -41,10 +44,10 @@ Ringkasan; spesifikasi lengkap per native lihat [docs/API.md](docs/API.md).
 | Native | Fungsi |
 |---|---|
 | `PG_Version(dest[], size)` | Kode & teks versi plugin |
-| `PG_Connect(host,user,pass,db,port,cb)` | Koneksi key-value; TLS sesuai `sslmode` di `pgstream.toml` (default `require`) |
-| `PG_ConnectUrl(url,cb)` | Koneksi via URL; TLS sesuai `sslmode=` di URL (fallback: config) |
-| `PG_Close(conn)` | Tutup koneksi |
-| `PG_IsConnected(conn)` | Status hidup koneksi |
+| `PG_Connect(host,user,pass,db,port,cb)` | Koneksi key-value; TLS sesuai `sslmode` di `pgstream.toml` (default `require`); callback `cb` multi-shot (dipanggil lagi setiap reconnect) |
+| `PG_ConnectUrl(url,cb)` | Koneksi via URL; TLS sesuai `sslmode=` di URL (fallback: config); callback `cb` multi-shot (dipanggil lagi setiap reconnect) |
+| `PG_Close(conn)` | Tutup koneksi + hentikan supervisor auto-reconnect |
+| `PG_IsConnected(conn)` | Status hidup koneksi (`false` saat reconnecting) |
 | `PG_GetError(conn,dest,size)` | Pesan error terakhir |
 | `PG_EscapeString(conn,src,dest,size)` | Escape string untuk SQL |
 | `PG_AsyncQuery(conn,query,cb,format,...)` | Query async + parameter varargs |
@@ -56,7 +59,7 @@ Ringkasan; spesifikasi lengkap per native lihat [docs/API.md](docs/API.md).
 | `PG_FieldName(result,col,dest,size)` | Nama kolom |
 | `PG_FreeResult(result)` | Bebaskan memori result |
 
-Semua native dideklarasikan di `pawn/include/pgstream.inc` (`PGSTREAM_VERSION` = 200).
+Semua native dideklarasikan di `pawn/include/pgstream.inc` (`PGSTREAM_VERSION` = 300).
 
 ## Build
 
@@ -93,6 +96,9 @@ cargo build --target i686-pc-windows-gnu --release
    sslmode = "verify-full"
    connect_timeout_seconds = 5
    query_timeout_seconds = 10
+   reconnect_enabled = true
+   reconnect_max_delay_seconds = 30
+   keepalive_interval_seconds = 60
 
    [pool]
    max_size = 10
@@ -101,7 +107,7 @@ cargo build --target i686-pc-windows-gnu --release
    level = "debug"
    ```
 
-   Field lengkap lihat bagian [Konfigurasi](#konfigurasi-pgstreamtoml). Contoh memakai `password_env` (password dari env var, bukan plaintext di file) dan `sslmode = "verify-full"` (wajib produksi); `pool.max_size` = batas koneksi aktif, bukan pool idle.
+   Field lengkap lihat bagian [Konfigurasi](#konfigurasi-pgstreamtoml). Contoh memakai `password_env` (password dari env var, bukan plaintext di file) dan `sslmode = "verify-full"` (wajib produksi); `pool.max_size` = batas koneksi aktif, bukan pool idle; tiga key terakhir mengatur auto-reconnect & keepalive.
 4. Restart server. Plugin load saat `Load()` SA:MP SDK; versi tercetak lewat `logprintf`.
 
 ## Konfigurasi pgstream.toml
@@ -121,6 +127,9 @@ Struct sumber `src/config.rs`. Semua section punya default; field wajib dalam pr
 | `sslmode` | string | `require` | Mode TLS; lihat [TLS / sslmode](#tls--sslmode) |
 | `connect_timeout_seconds` | u64 | 5 | Batas durasi koneksi (diterapkan) |
 | `query_timeout_seconds` | u64 | 15 | Batas durasi query (diterapkan); melebihi → error `Query timed out after Ns` |
+| `reconnect_enabled` | bool | `true` | Auto-reconnect setelah koneksi mati; `false` → outage final, status handle `Failed` |
+| `reconnect_max_delay_seconds` | u64 | 30 | Cap backoff reconnect (mulai 1s, dobel: 1→2→4→…→30) |
+| `keepalive_interval_seconds` | u64 | 60 | Interval probe `SELECT 1`; `0` = probe mati |
 
 `[pool]`:
 
@@ -151,6 +160,49 @@ Catatan implementasi: `verify-ca` dan `verify-full` memakai connector terverifik
 | `level` | `info` | `debug` untuk troubleshooting |
 
 Catatan: kalau file tidak ada / TOML tidak valid, `Config::load_from_file` diam-diam fallback ke struct Default (jangan berharap error log dari konfigurasi).
+
+## Auto-reconnect & keepalive
+
+Sejak v0.3.0, setiap handle dari `PG_Connect`/`PG_ConnectUrl` diawasi supervisor sendiri (`src/plugin.rs::supervise`).
+
+### Alur supervisor
+
+1. Connect ke database (TLS sesuai `sslmode`).
+2. Pump notifikasi berjalan di background — pesan `LISTEN`/`NOTIFY` diteruskan ke Pawn lewat `OnPGNotify`.
+3. Socket dipantau: EOF/error dari socket (mis. pooler menutup koneksi idle) atau probe keepalive yang gagal → koneksi dianggap mati.
+4. Status handle diubah menjadi `Connecting` (jadi `PG_IsConnected` = `false`), `prepared_statements` dihapus (objek `Statement` tidak bisa hidup pindah ke client baru), lalu connect ulang setelah backoff.
+5. Connect berhasil → prepared statement & channel `LISTEN` di-restore otomatis (`restore_session`), lalu callback connect dipanggil dengan `success=true`.
+
+Slot handle tetap dihitung terhadap `pool.max_size` selama reconnecting (status `Connecting` masih dihitung sebagai koneksi aktif).
+
+### Backoff
+
+- Mulai 1 detik, menggandakan tiap percobaan gagal: 1s → 2s → 4s → 8s → 16s → 30s (`src/config.rs::next_backoff`).
+- Cap = `database.reconnect_max_delay_seconds` (default 30).
+- Backoff direset ke 1 detik setiap kali connect berhasil.
+- `database.reconnect_enabled = false` → setelah outage tidak ada percobaan ulang; status handle `Failed`, log: `[PGStream] Connection lost (conn N): <alasan> — reconnect disabled`.
+
+### Keepalive
+
+- Probe `SELECT 1` setiap `database.keepalive_interval_seconds` (default 60; `0` = probe mati). Timeout probe memakai `database.query_timeout_seconds` (default 15) — sama dengan timeout query biasa, bukan angka tetap.
+- Probe **dilewati** kalau koneksi sedang dipakai query lain (client lock dipegang). Pengatur waktu slot probe tetap maju meskipun probe di-skip, sehingga percobaan berikutnya baru **1 interval keepalive lagi** — bukan 1 detik setelahnya.
+- Probe gagal → **2 kegagalan berturut-turut** (`probe_failures >= 2`) baru dianggap koneksi mati (socket half-open terdeteksi) → supervisor reconnect. Kegagalan pertama hanya di-log (`[PGStream] Keepalive probe failed on conn N (1): <alasan>`); probe yang sukses mengembalikan penghitung kegagalan ke 0.
+
+### Callback connect (multi-shot)
+
+Callback yang diberikan ke `PG_Connect`/`PG_ConnectUrl` **bisa dipanggil lebih dari sekali**:
+
+| Callback | Kapan dipanggil | Berapa kali |
+|---|---|---|
+| `success=true` | setiap koneksi (re)berhasil | 1× per koneksi |
+| `success=false` | outage — connect gagal di awal, atau koneksi yang sudah hidup mati | tepat 1× per outage (bukan per retry) |
+
+Pakai callback ini untuk re-sync state aplikasi setiap kali koneksi kembali hidup (mis. muat ulang cache dari database, atur ulang state sesi). `success=false` sekali per outage = momen yang tepat untuk memberi tahu pemain/log bahwa database sedang tidak tersedia.
+
+### Restore session setelah reconnect
+
+- **Prepared statement**: SQL disimpan per nama (`PgConnection::prepared_sqls`); setelah reconnect, masing-masing di-prepare ulang. Gamemode **tidak perlu** memanggil `PG_Prepare` lagi. Kalau re-prepare gagal (mis. tabel sudah di-drop), kegagalannya hanya di-log server dan statement tersebut tidak tersedia sampai gamemode mempersiapkannya ulang.
+- **Channel `LISTEN`**: setiap channel yang pernah sukses di-issue ulang sebagai `LISTEN <channel>` (`PgConnection::listen_channels`). Gamemode **tidak perlu** memanggil `PG_Listen` lagi. Kegagalan re-LISTEN hanya di-log.
 
 ## Kompilasi Pawn
 
@@ -196,8 +248,11 @@ Tiap koneksi (management oleh `handles.rs`: `CONNECTIONS`, `RESULTS`) menjalanka
 ## Testing
 
 - Unit/integration Rust: `cargo test`.
-- Live test end-to-end: `pawn/tests/pgstream_test.pwn` — mencakup TLS connect, SELECT/INSERT, transaksi, prepared statement, LISTEN/NOTIFY, escape string. Jalankan sebagai gamemode di server SA:MP dengan `pgstream.toml` mengarah ke database test.
-- E2E harness: `scripts/test-e2e.sh <server-dir> [timeout-detik]` — build `pgstream.dll`, salin ke `server-dir/plugins/pgstream.dll`, kompilasi `pawn/tests/pgstream_test.pwn` → `.amx` via wine `pawncc.exe` (`pawno/include` + `pawn/include`), jalankan `samp-server.exe` (wine) dan asersi log (`PASS: ...`, tanpa `FAIL`). URL database test dari env **`PGSTREAM_TEST_URL`** (sekret tidak disimpan di repo; disuntikkan ke salinan `.pwn` via `sed`). Jika `PGSTREAM_TEST_URL` kosong/tidak di-set → print `SKIP` & exit 0.
+  - `tests/reconnect_tests.rs` — 9 test untuk auto-reconnect: default config, accessor global (`reconnect_enabled`/`reconnect_max_delay()`/`keepalive_interval()`), TOML lama tanpa key reconnect (kompatibilitas default), TOML dengan key baru, backoff (`next_backoff` dobel & cap), backoff tidak pernah di bawah 1 detik (`reconnect_max_delay_seconds = 0`), batas nama channel `LISTEN` 63 byte (NAMEDATALEN, dihitung per byte), pelacakan prepared SQL (`prepared_sqls`) dan channel `LISTEN` (`listen_channels`), dan `PG_Close` yang menghapus handle sehingga supervisor berhenti.
+  - `src/plugin.rs::keepalive_probe_succeeds_on_live_db` — live test keepalive probe terhadap database; dilewati (SKIP) bila `PGSTREAM_TEST_URL` tidak di-set.
+  - **CI tidak menjalankan test live**: runner GitHub Actions tidak punya `PGSTREAM_TEST_URL`, jadi `keepalive_probe_succeeds_on_live_db` selalu skip (hijau) dan harness e2e `scripts/test-e2e.sh` juga skip. Live coverage hanya bisa dijalankan lokal.
+- Live test end-to-end: `pawn/tests/pgstream_test.pwn` — mencakup TLS connect, SELECT/INSERT, transaksi, prepared statement, LISTEN/NOTIFY, escape string, **dan fase reconnect** (self-terminate backend → socket EOF → plugin connect ulang pada handle yang sama; log `PASS RECONNECT`). Jalankan sebagai gamemode di server SA:MP dengan `pgstream.toml` mengarah ke database test.
+- E2E harness: `scripts/test-e2e.sh <server-dir> [timeout-detik]` — build `pgstream.dll` (cross `i686-pc-windows-gnu`), salin ke `plugins/`, kompilasi `pawn/tests/pgstream_test.pwn` via wine `pawncc.exe`, jalankan server, asersi log (`PASS: TLS connection established`, `PASS: Inserted`, `PASS RECONNECT`, `=== ALL INTEGRATION TESTS COMPLETED ===`, tanpa `FAIL`). URL database test dari env **`PGSTREAM_TEST_URL`** (sekret tidak disimpan di repo; disuntikkan ke salinan `.pwn` via `sed`). Jika `PGSTREAM_TEST_URL` kosong/tidak di-set → print `SKIP` & exit 0.
 
 ## CI & Release
 
@@ -206,6 +261,11 @@ Tiap koneksi (management oleh `handles.rs`: `CONNECTIONS`, `RESULTS`) menjalanka
 
 ## Batasan yang diketahui
 
+- **Multi-statement tidak didukung** — satu statement per panggilan `PG_AsyncQuery`/`PG_ExecutePrepared`; string yang berisi beberapa statement berbalik error dan tidak dieksekusi (sebagian maupun keseluruhan).
+- **Transaksi yang sedang berjalan hilang saat reconnect** — transaksi terbuka hidup di sesi yang mati; server melakukan rollback. Setelah reconnect, gamemode harus mengeluarkan `PG_Begin` lagi (momen yang tepat: callback connect `success=true`).
+- **Native query/transaksi/listen/prepare di-skip saat reconnect** — selama status `Connecting`, native `PG_AsyncQuery`/`PG_Begin`/`PG_Commit`/`PG_Rollback`/`PG_Listen`/`PG_Prepare` mengembalikan `0` **tanpa memanggil callback** (client tidak ada). Gamemode yang menunggu callback akan diam selama outage (bisa menit); tunda query hingga callback connect `success=1` terpanggil kembali. Detail: [docs/API.md](docs/API.md).
+- **`PG_FreeResult` wajib dipanggil** — result tidak dibebaskan otomatis; setiap result yang masuk ke callback query harus di-free (sukses maupun gagal) supaya memori tidak menumpuk.
+- **Timeout statement/queue tidak mencakup antre lock** — `query_timeout_seconds` hanya berlaku selama eksekusi query; waktu menunggu giliran lock koneksi (query lain masih jalan) tidak dihitung terhadap timeout.
 - Tipe kolom belum didukung: `NUMERIC`, `UUID`, `JSON`/`JSONB`, `BYTEA`. Baca via `PG_GetString` tidak dijamin.
 - **`sslmode=require`/`prefer` tidak memverifikasi sertifikat server** (encrypted tapi unauthenticated — setara `require` di libpq). Berlaku untuk kedua jalur koneksi (`PG_Connect` via config, `PG_ConnectUrl` via URL). By design; **produksi wajib `sslmode=verify-full`** (lihat [TLS / sslmode](#tls--sslmode)).
 - Format varargs terikat ke **pawncc 3.2.3664**. Compiler Pawn lain tak kompatibel.

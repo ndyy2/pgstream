@@ -1,16 +1,17 @@
 /*
  *  pgstream — native PostgreSQL plugin for SA:MP
- *  Version 0.2.0
+ *  Version 0.3.0
  *
  *  Features: TLS/SSL, Transactions, Listen/Notify, Prepared Statements,
- *            Parameterized Queries, Result API (index & name).
+ *            Parameterized Queries, Result API (index & name),
+ *            Auto-Reconnect (supervisor keeps handles alive).
  */
 #if defined _pgstream_included
 	#endinput
 #endif
 #define _pgstream_included
 
-#define PGSTREAM_VERSION 200
+#define PGSTREAM_VERSION 300
 
 // Plugin version info
 native PG_Version(dest[], size = sizeof(dest));

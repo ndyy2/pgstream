@@ -44,8 +44,8 @@ pub fn logprintf(msg: &str) {
     }
 }
 
-pub const VERSION_CODE: Cell = 200;
-const VERSION_TEXT: &str = "PGStream 0.2.1";
+pub const VERSION_CODE: Cell = 300;
+pub const VERSION_TEXT: &str = "PGStream 0.3.0";
 
 // ---------------------------------------------------------------------------
 // TLS
@@ -137,8 +137,8 @@ pub unsafe extern "system" fn Load(pp_data: *mut *mut c_void) -> bool {
 
     let cfg = config::Config::global();
     logprintf(&format!(
-        "[PGStream] v0.2.0 initialized (Max connections: {}, Host: {})",
-        cfg.pool.max_size, cfg.database.host
+        "{} initialized (Max connections: {}, Host: {})",
+        VERSION_TEXT, cfg.pool.max_size, cfg.database.host
     ));
 
     !AMX_TABLE.load(Ordering::Relaxed).is_null()
@@ -390,13 +390,7 @@ async fn execute_query_internal<T: tokio_postgres::ToStatement + Sync + ?Sized>(
                 let len = data_rows.len() as u64;
                 QueryResult::new(cols, data_rows, len)
             }
-            Err(e) => {
-                if let Ok(affected) = client.execute(query, &params_refs[..]).await {
-                    QueryResult::empty_success(affected)
-                } else {
-                    QueryResult::error(e.to_string())
-                }
-            }
+            Err(e) => QueryResult::error(e.to_string()),
         }
     };
 
@@ -645,95 +639,464 @@ fn spawn_connect(conn_str: String, callback: String) -> Cell {
         return conn_id;
     }
 
-    runtime::spawn(async move {
-        let fallback = config::default_sslmode_value();
-        let resolved = config::resolve_ssl_mode(&conn_str, &fallback);
-        let mut pg_cfg = match tokio_postgres::Config::from_str(&resolved.conn) {
-            Ok(c) => c,
-            Err(e) => {
-                fail_connect(
-                    conn_id,
-                    &callback,
-                    &format!("Invalid connection config: {}", e),
-                );
-                return;
-            }
-        };
-        pg_cfg.connect_timeout(config::connect_timeout());
+    runtime::spawn(supervise(conn_id, conn_str, callback));
 
-        if resolved.mode == config::TlsMode::NoValidate {
-            logprintf(&format!(
-                "[PGStream] WARN: TLS tanpa verifikasi sertifikat (sslmode={}). Untuk produksi pakai sslmode=verify-full.",
-                resolved.sslmode
-            ));
+    conn_id
+}
+
+/// PostgreSQL NAMEDATALEN: the server truncates names longer than 63 bytes.
+pub const MAX_NAME_BYTES: usize = 63;
+
+/// True when a LISTEN/NOTIFY channel name would be truncated by the server.
+pub fn channel_name_too_long(channel: &str) -> bool {
+    channel.len() > MAX_NAME_BYTES
+}
+
+/// Display of an error plus its full cause chain (the `Display` of
+/// `tokio_postgres::Error` alone is static, e.g. "error communicating with
+/// the server").
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut s = e.to_string();
+    let mut src = std::error::Error::source(e);
+    while let Some(cause) = src {
+        s.push_str(": ");
+        s.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    s
+}
+
+/// True while the handle is still registered (a `PG_Close` removes it and the
+/// supervisor must stop reconnecting).
+pub fn handle_exists(conn_id: i32) -> bool {
+    CONNECTIONS.lock().unwrap().contains_key(&conn_id)
+}
+
+/// Drops a connection handle. Returns true when a handle was removed.
+pub fn close_connection(conn_id: i32) -> bool {
+    let mut conns = CONNECTIONS.lock().unwrap();
+    match conns.remove(&conn_id) {
+        Some(mut c) => {
+            c.status = ConnectionStatus::Disconnected;
+            c.client = None;
+            true
         }
+        None => false,
+    }
+}
 
-        let tls = match resolved.mode {
-            config::TlsMode::Verified => make_tls_connector_verified(),
-            _ => make_tls_connector_novalidate(),
-        };
+/// Supervisor for one connection handle.
+///
+/// Owns the whole lifecycle: connect, keep the session alive, and reconnect
+/// after the socket dies (idle pooler close, server restart, backend killed).
+///
+/// Callback contract:
+/// - `success=false` fires exactly once per outage (first connect failure or
+///   an established connection dying) — never once per retry.
+/// - `success=true` fires exactly once per successful (re)connect, so a
+///   gamemode can re-prepare/re-LISTEN on its own if it wants to.
+async fn supervise(conn_id: i32, conn_str: String, callback: String) {
+    let fallback = config::default_sslmode_value();
+    let resolved = config::resolve_ssl_mode(&conn_str, &fallback);
+    let mut pg_cfg = match tokio_postgres::Config::from_str(&resolved.conn) {
+        Ok(c) => c,
+        Err(e) => {
+            // Permanent: a broken connection string never becomes valid.
+            fail_connect(
+                conn_id,
+                &callback,
+                &format!("Invalid connection config: {}", e),
+            );
+            return;
+        }
+    };
+    pg_cfg.connect_timeout(config::connect_timeout());
 
-        match pg_cfg.connect(tls).await {
+    if resolved.mode == config::TlsMode::NoValidate {
+        logprintf(&format!(
+            "[PGStream] WARN: TLS tanpa verifikasi sertifikat (sslmode={}). Untuk produksi pakai sslmode=verify-full.",
+            resolved.sslmode
+        ));
+    }
+
+    let tls = match resolved.mode {
+        config::TlsMode::Verified => make_tls_connector_verified(),
+        _ => make_tls_connector_novalidate(),
+    };
+
+    let reconnect_enabled = config::reconnect_enabled();
+    let max_delay = config::reconnect_max_delay();
+    let keepalive = config::keepalive_interval();
+    let mut delay = std::time::Duration::from_secs(1);
+    let mut attempt = 0u32;
+    let mut outage_reported = false;
+
+    loop {
+        if !handle_exists(conn_id) {
+            break; // PG_Close — handle gone, stop supervising
+        }
+        if !reconnect_enabled && attempt > 0 {
+            break;
+        }
+        attempt += 1;
+
+        match pg_cfg.connect(tls.clone()).await {
             Ok((client, connection)) => {
-                // Spawn connection handler that processes notifications via Stream
-                let cid = conn_id;
-                tokio::spawn(async move {
-                    use futures_util::future::poll_fn;
-                    use std::task::Poll;
+                delay = std::time::Duration::from_secs(1);
+                if !handle_exists(conn_id) {
+                    return; // PG_Close while connect() ran — drop the socket, no callback
+                }
+                let client_arc = Arc::new(AsyncMutex::new(client));
+                let (death_tx, mut death_rx) = tokio::sync::mpsc::channel::<String>(1);
+                let cancel = Arc::new(tokio::sync::Notify::new());
+                let pump = tokio::spawn({
+                    let cancel = cancel.clone();
+                    async move {
+                        use futures_util::future::poll_fn;
 
-                    let mut conn = connection;
-                    loop {
-                        let msg = poll_fn(|cx| match conn.poll_message(cx) {
-                            Poll::Ready(Some(r)) => Poll::Ready(Some(r)),
-                            Poll::Ready(None) => Poll::Ready(None),
-                            Poll::Pending => Poll::Pending,
-                        })
-                        .await;
+                        let mut connection = connection;
+                        loop {
+                            let msg = tokio::select! {
+                                _ = cancel.notified() => return,
+                                msg = poll_fn(|cx| connection.poll_message(cx)) => msg,
+                            };
 
-                        match msg {
-                            Some(Ok(tokio_postgres::AsyncMessage::Notification(n))) => {
-                                runtime::send_completion(CompletionEvent::Notification {
-                                    conn_id: cid,
-                                    channel: n.channel().to_string(),
-                                    payload: n.payload().to_string(),
-                                });
-                            }
-                            Some(Ok(_)) => {} // notices, parameter status updates
-                            Some(Err(e)) => {
-                                logprintf(&format!("[PGStream] Connection error: {}", e));
-                                let mut conns = CONNECTIONS.lock().unwrap();
-                                if let Some(c) = conns.get_mut(&cid) {
-                                    c.status = ConnectionStatus::Failed;
-                                    c.last_error = Some(e.to_string());
+                            match msg {
+                                Some(Ok(tokio_postgres::AsyncMessage::Notification(n))) => {
+                                    runtime::send_completion(CompletionEvent::Notification {
+                                        conn_id,
+                                        channel: n.channel().to_string(),
+                                        payload: n.payload().to_string(),
+                                    });
                                 }
-                                break;
+                                Some(Ok(_)) => {} // notices, parameter status updates
+                                Some(Err(e)) => {
+                                    let _ = death_tx.send(error_chain(&e)).await;
+                                    return;
+                                }
+                                None => {
+                                    // EOF: the server (or an idle pooler) closed the socket.
+                                    let _ = death_tx
+                                        .send("connection closed by server".to_string())
+                                        .await;
+                                    return;
+                                }
                             }
-                            None => break, // connection closed
                         }
                     }
                 });
 
+                // Restore the dead session state before the client becomes
+                // visible: while it runs, PG_IsConnected stays 0 (honest).
+                let restore_failures = restore_session(conn_id, &client_arc).await;
+                if restore_failures > 0 {
+                    logprintf(&format!(
+                        "[PGStream] Restore session on conn {}: {} statement(s)/channel(s) failed to restore",
+                        conn_id, restore_failures
+                    ));
+                }
+
+                if !handle_exists(conn_id) {
+                    cancel.notify_one();
+                    let _ = pump.await;
+                    return; // PG_Close during restore
+                }
+
+                // F7: the socket may have died mid-restore — never install a
+                // dead client; fall through to the outage path instead.
+                let mut reason = poll_death(&mut death_rx);
+
+                // Install atomically under one CONNECTIONS lock: the success
+                // callback, status flip and client swap are visible together, so
+                // PG_Close cannot observe and tear down a half-installed client
+                // (T2), and a death racing the install is re-checked inside the
+                // lock (T3). send_completion only touches QUEUE, never held
+                // across CONNECTIONS anywhere, so this cannot deadlock.
+                let mut send_ok = false;
+                let mut handle_missing = false;
                 {
                     let mut conns = CONNECTIONS.lock().unwrap();
-                    if let Some(c) = conns.get_mut(&conn_id) {
-                        c.status = ConnectionStatus::Connected;
-                        c.client = Some(Arc::new(AsyncMutex::new(client)));
+                    match conns.get_mut(&conn_id) {
+                        Some(c) => {
+                            if reason.is_none() {
+                                // T3: second check inside the lock — if the pump
+                                // died after the first try_recv, the install is
+                                // cancelled instead of installing a dead client.
+                                reason = poll_death(&mut death_rx);
+                            }
+                            if reason.is_none() {
+                                c.status = ConnectionStatus::Connected;
+                                c.client = Some(client_arc.clone());
+                                c.last_error = None;
+                                // T2: emitted with the lock held → atomic with
+                                // the status flip, exactly one per (re)connect.
+                                runtime::send_completion(CompletionEvent::Connected {
+                                    conn_id,
+                                    success: true,
+                                    callback: callback.clone(),
+                                });
+                                send_ok = true;
+                            } else {
+                                c.status = ConnectionStatus::Connecting;
+                                c.last_error = reason.clone();
+                                c.client = None;
+                                c.prepared_statements.clear();
+                            }
+                        }
+                        None => handle_missing = true,
                     }
                 }
 
-                runtime::send_completion(CompletionEvent::Connected {
+                if handle_missing {
+                    // F1: PG_Close removed the handle while we were restoring.
+                    cancel.notify_one();
+                    let _ = pump.await;
+                    return;
+                }
+
+                if send_ok {
+                    outage_reported = false;
+                }
+
+                // One ticker per connection: checks the handle every second and
+                // probes the socket every `keepalive`.
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+                let mut last_probe = std::time::Instant::now();
+                let mut probe_failures = 0u32;
+
+                let reason = match reason {
+                    Some(reason) => reason,
+                    None => loop {
+                        tokio::select! {
+                            reason = death_rx.recv() => {
+                                break reason.unwrap_or_else(|| "connection lost".to_string());
+                            }
+                            _ = ticker.tick() => {
+                                if !handle_exists(conn_id) {
+                                    cancel.notify_one();
+                                    let _ = pump.await;
+                                    return; // PG_Close — stop supervising
+                                }
+                                if !keepalive.is_zero() && last_probe.elapsed() >= keepalive {
+                                    match keepalive_probe(&client_arc).await {
+                                        Ok(true) => {
+                                            // T6: reset the schedule only when
+                                            // a probe really ran, so a skipped
+                                            // probe (client busy) is retried
+                                            // next tick instead of next keepalive.
+                                            last_probe = std::time::Instant::now();
+                                            probe_failures = 0;
+                                        }
+                                        Ok(false) => {} // busy with a query — try again next tick
+                                        Err(e) => {
+                                            last_probe = std::time::Instant::now();
+                                            probe_failures += 1;
+                                            if probe_failures >= 2 {
+                                                cancel.notify_one();
+                                                break e;
+                                            }
+                                            // One slow probe is not death —
+                                            // log once and try again next interval.
+                                            logprintf(&format!(
+                                                "[PGStream] Keepalive probe failed on conn {} ({}): {}",
+                                                conn_id, probe_failures, e
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                };
+
+                cancel.notify_one();
+                let _ = pump.await;
+
+                {
+                    let mut conns = CONNECTIONS.lock().unwrap();
+                    if let Some(c) = conns.get_mut(&conn_id) {
+                        // Slot stays reserved (status Connecting) so the
+                        // max_size cap stays honest while reconnecting.
+                        c.status = ConnectionStatus::Connecting;
+                        c.last_error = Some(reason.clone());
+                        c.client = None;
+                        c.prepared_statements.clear();
+                    }
+                }
+
+                if !outage_reported {
+                    runtime::send_completion(CompletionEvent::Connected {
+                        conn_id,
+                        success: false,
+                        callback: callback.clone(),
+                    });
+                    outage_reported = true;
+                }
+
+                if !reconnect_enabled {
+                    logprintf(&format!(
+                        "[PGStream] Connection lost (conn {}): {} — reconnect disabled",
+                        conn_id, reason
+                    ));
+                    {
+                        let mut conns = CONNECTIONS.lock().unwrap();
+                        if let Some(c) = conns.get_mut(&conn_id) {
+                            c.status = ConnectionStatus::Failed;
+                        }
+                    }
+                    break;
+                }
+
+                logprintf(&format!(
+                    "[PGStream] Connection lost (conn {}): {} — reconnecting in {}s",
                     conn_id,
-                    success: true,
-                    callback,
-                });
+                    reason,
+                    delay.as_secs()
+                ));
+                tokio::time::sleep(delay).await;
+                delay = config::next_backoff(delay, max_delay);
             }
             Err(e) => {
-                fail_connect(conn_id, &callback, &e.to_string());
+                let chain = error_chain(&e);
+                {
+                    let mut conns = CONNECTIONS.lock().unwrap();
+                    if let Some(c) = conns.get_mut(&conn_id) {
+                        c.status = ConnectionStatus::Connecting;
+                        c.last_error = Some(chain.clone());
+                    }
+                }
+                logprintf(&format!(
+                    "[PGStream] Connect failed (conn {}): {} — retrying in {}s",
+                    conn_id,
+                    chain,
+                    delay.as_secs()
+                ));
+                if !outage_reported {
+                    runtime::send_completion(CompletionEvent::Connected {
+                        conn_id,
+                        success: false,
+                        callback: callback.clone(),
+                    });
+                    outage_reported = true;
+                }
+                if !reconnect_enabled {
+                    {
+                        let mut conns = CONNECTIONS.lock().unwrap();
+                        if let Some(c) = conns.get_mut(&conn_id) {
+                            c.status = ConnectionStatus::Failed;
+                        }
+                    }
+                    break;
+                }
+                tokio::time::sleep(delay).await;
+                delay = config::next_backoff(delay, max_delay);
             }
         }
-    });
+    }
+}
 
-    conn_id
+/// Non-blocking death check for the connection pump: `None` = still alive,
+/// `Some(reason)` = dead (a dropped pump sender counts as death).
+fn poll_death(death_rx: &mut tokio::sync::mpsc::Receiver<String>) -> Option<String> {
+    match death_rx.try_recv() {
+        Ok(reason) => Some(reason),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+            Some("connection lost".to_string())
+        }
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+    }
+}
+
+/// Re-prepares stored statements and re-issues LISTEN after a reconnect:
+/// both live on the server/client pair, so they die with the old connection.
+///
+/// Returns the number of entries that could not be restored (failed prepare +
+/// failed LISTEN).
+async fn restore_session(conn_id: i32, client: &Arc<AsyncMutex<tokio_postgres::Client>>) -> usize {
+    let (sqls, channels) = {
+        let conns = CONNECTIONS.lock().unwrap();
+        match conns.get(&conn_id) {
+            Some(c) => (c.prepared_sqls.clone(), c.listen_channels.clone()),
+            None => return 0,
+        }
+    };
+
+    let lock = client.lock().await;
+    let mut statements = std::collections::HashMap::new();
+    let mut failed: Vec<String> = Vec::new();
+    let mut failures = 0usize;
+    for (name, sql) in &sqls {
+        // T1: bounded — a hung server must not stall the supervisor forever.
+        match tokio::time::timeout(config::query_timeout(), lock.prepare(sql)).await {
+            Ok(Ok(stmt)) => {
+                statements.insert(name.clone(), stmt);
+            }
+            Ok(Err(e)) => {
+                failures += 1;
+                failed.push(name.clone());
+                logprintf(&format!(
+                    "[PGStream] Re-prepare '{}' failed on conn {}: {}",
+                    name, conn_id, e
+                ));
+            }
+            Err(_) => {
+                failures += 1;
+                failed.push(name.clone());
+                logprintf(&format!(
+                    "[PGStream] Re-prepare '{}' timed out on conn {}",
+                    name, conn_id
+                ));
+            }
+        }
+    }
+    for channel in &channels {
+        let sql = format!("LISTEN {}", escape_identifier(channel));
+        match tokio::time::timeout(config::query_timeout(), lock.batch_execute(&sql)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                failures += 1;
+                logprintf(&format!(
+                    "[PGStream] Re-LISTEN '{}' failed on conn {}: {}",
+                    channel, conn_id, e
+                ));
+            }
+            Err(_) => {
+                failures += 1;
+                logprintf(&format!(
+                    "[PGStream] Re-LISTEN '{}' timed out on conn {}",
+                    channel, conn_id
+                ));
+            }
+        }
+    }
+    drop(lock);
+
+    let mut conns = CONNECTIONS.lock().unwrap();
+    if let Some(c) = conns.get_mut(&conn_id) {
+        // Merge per entry: statements that failed to re-prepare are dropped
+        // (they would be dead), the rest are replaced by the fresh ones.
+        for name in &failed {
+            c.prepared_statements.remove(name);
+        }
+        for (name, stmt) in statements {
+            c.prepared_statements.insert(name, stmt);
+        }
+    }
+    failures
+}
+
+/// `SELECT 1` probe that detects half-open sockets. Returns `Ok(false)`
+/// (probe skipped) when another query holds the client lock, so callers can
+/// keep the probe schedule honest.
+async fn keepalive_probe(client: &Arc<AsyncMutex<tokio_postgres::Client>>) -> Result<bool, String> {
+    let Ok(lock) = client.try_lock() else {
+        return Ok(false); // busy with a query — try again next tick
+    };
+    match tokio::time::timeout(config::query_timeout(), lock.query_one("SELECT 1", &[])).await {
+        Ok(Ok(_)) => Ok(true),
+        Ok(Err(e)) => Err(error_chain(&e)),
+        Err(_) => Err("keepalive timeout".to_string()),
+    }
 }
 
 /// native PG_Close(connection);
@@ -741,10 +1104,7 @@ unsafe extern "C" fn pg_close(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
     let Some(conn_id) = amx::native_arg(params, 1) else {
         return 0;
     };
-    let mut conns = CONNECTIONS.lock().unwrap();
-    if let Some(mut c) = conns.remove(&conn_id) {
-        c.status = ConnectionStatus::Disconnected;
-        c.client = None;
+    if close_connection(conn_id) {
         1
     } else {
         0
@@ -868,6 +1228,20 @@ unsafe extern "C" fn pg_listen(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
     };
     let channel = read_string_arg(amx_ptr, params, 2).unwrap_or_default();
     let callback = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
+    if channel_name_too_long(&channel) {
+        logprintf(&format!(
+            "[PGStream] LISTEN channel '{}' rejected: name exceeds {} bytes (server NAMEDATALEN)",
+            channel, MAX_NAME_BYTES
+        ));
+        if !callback.is_empty() {
+            runtime::send_completion(CompletionEvent::CommandFinished {
+                conn_id,
+                success: false,
+                callback,
+            });
+        }
+        return 0;
+    }
     let Some(client) = get_client_arc(conn_id) else {
         return 0;
     };
@@ -882,6 +1256,12 @@ unsafe extern "C" fn pg_listen(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
                 channel, conn_id
             ));
         } else {
+            {
+                let mut conns = CONNECTIONS.lock().unwrap();
+                if let Some(c) = conns.get_mut(&conn_id) {
+                    c.record_listen(&channel);
+                }
+            }
             logprintf(&format!(
                 "[PGStream] Listening on channel '{}' (conn {})",
                 channel, conn_id
@@ -905,6 +1285,13 @@ unsafe extern "C" fn pg_notify(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
     };
     let channel = read_string_arg(amx_ptr, params, 2).unwrap_or_default();
     let payload = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
+    if channel_name_too_long(&channel) {
+        logprintf(&format!(
+            "[PGStream] NOTIFY channel '{}' rejected: name exceeds {} bytes (server NAMEDATALEN)",
+            channel, MAX_NAME_BYTES
+        ));
+        return 0;
+    }
     let Some(client) = get_client_arc(conn_id) else {
         return 0;
     };
@@ -949,7 +1336,17 @@ unsafe extern "C" fn pg_prepare(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
                 {
                     let mut conns = CONNECTIONS.lock().unwrap();
                     if let Some(c) = conns.get_mut(&conn_id) {
-                        c.prepared_statements.insert(stmt_name.clone(), stmt);
+                        // T4: a `Statement` is bound to the client that made
+                        // it — if a reconnect swapped the client meanwhile,
+                        // the statement is stale and must not be stored.
+                        let same_client =
+                            c.client.as_ref().is_some_and(|a| Arc::ptr_eq(a, &client));
+                        if same_client {
+                            c.prepared_statements.insert(stmt_name.clone(), stmt);
+                        }
+                        // The SQL always survives: the supervisor re-prepares
+                        // it on the new client after a reconnect.
+                        c.record_prepared(&stmt_name, &query);
                     }
                 }
                 logprintf(&format!(
@@ -1286,6 +1683,32 @@ mod tests {
     use tokio_postgres::types::{FromSql, Type};
 
     #[test]
+    fn error_chain_walks_the_full_cause_chain() {
+        #[derive(Debug)]
+        struct Fake(
+            &'static str,
+            Option<Box<dyn std::error::Error + Send + Sync>>,
+        );
+        impl std::fmt::Display for Fake {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Fake {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1
+                    .as_ref()
+                    .map(|c| c.as_ref() as &(dyn std::error::Error + 'static))
+            }
+        }
+
+        let leaf = Fake("connection closed", None);
+        let root = Fake("db error", Some(Box::new(leaf)));
+        assert_eq!(error_chain(&root), "db error: connection closed");
+        assert_eq!(error_chain(&Fake("solo", None)), "solo");
+    }
+
+    #[test]
     fn temporal_columns_decode_to_non_empty_text() {
         // Postgres binary payloads: microseconds since 2000-01-01, days since 2000-01-01.
         let ts_raw = 1_026_490i64.to_be_bytes();
@@ -1322,5 +1745,30 @@ mod tests {
         assert_eq!(ts_text, "2000-01-01 00:00:01.026490");
         assert_eq!(date_text, "2000-01-31");
         assert_eq!(time_text, "01:01:01.500");
+    }
+
+    /// Live check of the keepalive probe. Needs `PGSTREAM_TEST_URL`; skipped
+    /// (but green) when the variable is absent so the suite runs without a DB.
+    #[tokio::test]
+    async fn keepalive_probe_succeeds_on_live_db() {
+        let Ok(url) = std::env::var("PGSTREAM_TEST_URL") else {
+            println!("SKIP: PGSTREAM_TEST_URL not set");
+            return;
+        };
+        let resolved = config::resolve_ssl_mode(&url, "require");
+        let mut cfg = tokio_postgres::Config::from_str(&resolved.conn).expect("valid config");
+        cfg.connect_timeout(config::connect_timeout());
+        let (client, connection) = cfg
+            .connect(make_tls_connector_novalidate())
+            .await
+            .expect("live connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let client = Arc::new(AsyncMutex::new(client));
+        assert!(
+            keepalive_probe(&client).await.is_ok(),
+            "keepalive probe must succeed on a healthy connection"
+        );
     }
 }

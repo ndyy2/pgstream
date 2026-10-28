@@ -20,7 +20,8 @@
 #      -i <repo>/pawn/include, output <server-dir>/gamemodes/pgstream_test.amx.
 #   5. Run `wine <server-dir>/samp-server.exe` with timeout (cwd = server-dir); capture log.
 #   6. Assert log contains PASS: TLS connection established, PASS: Inserted,
-#      === ALL INTEGRATION TESTS COMPLETED ===, and no FAIL; else print log & exit non-zero.
+#      PASS RECONNECT, === ALL INTEGRATION TESTS COMPLETED ===, and no FAIL;
+#      else print log & exit non-zero.
 #
 # If PGSTREAM_TEST_URL is empty/unset -> print SKIP message and exit 0 (no DB creds in repo).
 set -eu
@@ -123,6 +124,7 @@ echo "e2e: running server for $TIMEOUT s"
 OK=1
 grep -qF "PASS: TLS connection established" "$LOG" || OK=0
 grep -qF "PASS: Inserted" "$LOG" || OK=0
+grep -qF "PASS RECONNECT" "$LOG" || OK=0
 grep -qF "=== ALL INTEGRATION TESTS COMPLETED ===" "$LOG" || OK=0
 if grep -qF "FAIL" "$LOG"; then OK=0; fi
 

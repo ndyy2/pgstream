@@ -1,5 +1,28 @@
 # CHANGELOG — PGStream
 
+## [0.3.0] — 2026-10-28
+
+Supervisor per handle: koneksi yang mati dideteksi (EOF socket / keepalive), lalu connect ulang dengan backoff eksponensial. Versi: `PGSTREAM_VERSION` = `300`, `VERSION_CODE` = `300`, `PG_Version()` → `"PGStream 0.3.0"`, `Cargo.toml` `0.3.0`.
+
+### Ditambahkan
+
+- **Auto-reconnect per handle** — tiap `PG_Connect`/`PG_ConnectUrl` menjalankan supervisor sendiri (`src/plugin.rs::supervise`): connect → pump notifikasi → socket mati → backoff eksponensial 1s → 2s → 4s → … → cap `reconnect_max_delay_seconds` (default 30s) → connect ulang. Backoff direset ke 1s setiap koneksi berhasil (`src/config.rs::next_backoff`).
+- **Keepalive** — probe `SELECT 1` tiap `keepalive_interval_seconds` (default 60s, `0` = mati) dengan timeout `query_timeout_seconds` (default 15s, sama dengan timeout query); probe di-skip saat koneksi sedang dipakai query lain (percobaan berikutnya 1 interval lagi); koneksi dianggap mati setelah 2 kegagalan probe berturut-turut (`probe_failures >= 2`) — kegagalan pertama hanya di-log. Mendeteksi socket half-open (`src/plugin.rs::keepalive_probe`).
+- **Restore session setelah reconnect** — prepared statement di-prepare ulang otomatis (SQL disimpan per nama, `PgConnection::prepared_sqls`) dan channel `LISTEN` di-issue ulang otomatis (`PgConnection::listen_channels`). Gamemode tidak perlu mengulang `PG_Prepare`/`PG_Listen`.
+- **Config baru di `[database]`** — `reconnect_enabled` (default `true`), `reconnect_max_delay_seconds` (default `30`), `keepalive_interval_seconds` (default `60`, `0` = mati). `pgstream.toml` versi 0.2.x tanpa key ini tetap kompatibel (default dipakai).
+- **Test reconnect** — 9 unit test di `tests/reconnect_tests.rs` (default config, accessor global, TOML lama, TOML dengan key baru, backoff dobel & cap, backoff tidak pernah di bawah 1 detik, batas nama channel `LISTEN` 63 byte, pelacakan prepared SQL + channel `LISTEN`, `PG_Close` menghentikan supervisor) + fase reconnect pada e2e (`pawn/tests/pgstream_test.pwn` → `PASS RECONNECT`, diasersi `scripts/test-e2e.sh`). Catatan CI: `cargo test` di GitHub Actions berjalan tanpa `PGSTREAM_TEST_URL` — test live `keepalive_probe_succeeds_on_live_db` dan e2e selalu skip di runner, live coverage hanya lokal.
+
+### Diperbaiki
+
+- **EOF socket tidak lagi menyisakan status `Connected` palsu** — pump notifikasi mendeteksi EOF/error socket, handle ditandai bukan `Connected`, sehingga `PG_IsConnected` mengembalikan `false` dan supervisor langsung mencoba connect ulang. Sebelumnya socket yang sudah tertutup (mis. pooler Neon menutup koneksi idle) masih dilaporkan `Connected`.
+- **Double-execute statement dihapus** — `execute_query_internal` tidak lagi menjalankan ulang statement lewat `client.execute()` saat query error (risiko `double-INSERT`).
+
+### Perilaku berubah
+
+- **Callback connect menjadi multi-shot** — `success=true` dipanggil setiap koneksi (re)berhasil; `success=false` tepat 1× per outage (connect gagal di awal, atau koneksi yang sudah hidup mati), bukan per percobaan retry.
+- **Multi-statement tidak didukung** — satu statement per panggilan; string multi-statement kini berbalik error dan tidak dieksekusi.
+- **`PGSTREAM_VERSION` 200 → 300** — `PG_Version()` kini mengembalikan kode `300` dengan teks `"PGStream 0.3.0"`.
+
 ## [0.2.1] — 2026-10-28 (patch hardening)
 
 Patch penguatan di atas 0.2.0. `PGSTREAM_VERSION` tetap `200` (konstanta native ke klien Pawn); `Cargo.toml` kini `0.2.1` (sinkron dengan tag rilis; `PG_Connect`/`VERSION_TEXT` tetap menampilkan "0.2.x").

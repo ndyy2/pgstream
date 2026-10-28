@@ -1,6 +1,7 @@
 /*
- *  pgstream_test.pwn — Full Integration Test for PGStream v0.2.0
- *  Tests: TLS Connect, Query, Transactions, Listen/Notify, Prepared Statements
+ *  pgstream_test.pwn — Full Integration Test for PGStream v0.3.0
+ *  Tests: TLS Connect, Query, Transactions, Listen/Notify, Prepared Statements,
+ *         Auto-Reconnect (backend self-terminate -> socket EOF -> plugin reconnect)
  *  Target: postgresql://neondb_owner:***@<db-host>/<dbname>?sslmode=require&channel_binding=require
  */
 #include <a_samp>
@@ -9,6 +10,9 @@
 // Test state machine
 static g_conn = -1;
 static g_TestStep = 0;
+static g_ConnectCount = 0;     // jumlah callback OnDBConnect dengan success=1
+static g_ReconnectDone = 0;    // auto-reconnect sudah terverifikasi
+static g_CheckTimer = -1;      // timer id (KillTimer butuh id, bukan nama)
 
 // Callbacks
 forward OnDBConnect(connection, bool:success);
@@ -21,12 +25,17 @@ forward OnPrepared(connection, bool:success);
 forward OnPreparedQuery(connection, result, extra);
 forward OnListenReady(connection, bool:success);
 forward OnPGNotify(connection, const channel[], const payload[]);
+forward OnPreparedReady(connection, bool:success);
+forward OnRestoredPrepared(connection, result, extra);
 forward OnCleanup(connection, result, extra);
 forward OnFinalCheck(connection, result, extra);
+forward OnSelfKill(connection, result, extra);
+forward OnDropDone(connection, result, extra);
+forward CheckReconnect();
 
 main()
 {
-	print("[PGStream] === INTEGRATION TEST v0.2.0 ===");
+	print("[PGStream] === INTEGRATION TEST v0.3.0 ===");
 }
 
 public OnGameModeInit()
@@ -57,17 +66,35 @@ public OnDBConnect(connection, bool:success)
 	{
 		new err[256];
 		PG_GetError(connection, err, sizeof(err));
-		printf("[PGStream] FAIL: Connection failed: '%s'", err);
-		PG_Close(connection);
-		print("[PGStream] === TESTS FAILED (connection) ===");
+		// Jangan tutup handle: supervisor plugin mencoba reconnect sendiri.
+		printf("[PGStream] Connection down: '%s' — menunggu auto-reconnect", err);
 		return 1;
 	}
 
-	printf("[PGStream] PASS: TLS connection established! IsConnected: %d", PG_IsConnected(connection));
+	g_ConnectCount++;
 
-	// Test 3: Simple SELECT query
-	print("[PGStream] TEST Running SELECT 1+1 ...");
-	PG_AsyncQuery(connection, "SELECT 1+1 AS result, current_timestamp AS ts, version() AS pg_version", "OnTestQuery");
+	if (g_ConnectCount == 1)
+	{
+		printf("[PGStream] PASS: TLS connection established! IsConnected: %d", PG_IsConnected(connection));
+
+		// Test 3: Simple SELECT query
+		print("[PGStream] TEST Running SELECT 1+1 ...");
+		PG_AsyncQuery(connection, "SELECT 1+1 AS result, current_timestamp AS ts, version() AS pg_version", "OnTestQuery");
+		return 1;
+	}
+
+	// Reconnect berhasil (backend sebelumnya dibunuh server -> socket EOF).
+	printf("[PGStream] PASS RECONNECT: auto-reconnect works (connect count=%d)", g_ConnectCount);
+	g_ReconnectDone = 1;
+	if (g_CheckTimer != -1)
+	{
+		KillTimer(g_CheckTimer); // SetTimer interval 0 tidak menghentikan timer repeat
+		g_CheckTimer = -1;
+	}
+	// T7: LISTEN di-restore otomatis supervisor -> OnPGNotify tampilkan
+	// PASS RESTORE-LISTEN. Uji prepared 'sel_count' yang di-prepare ulang.
+	PG_Notify(connection, "pgstream_events", "after_reconnect");
+	PG_ExecutePrepared(connection, "sel_count", "OnRestoredPrepared");
 	return 1;
 }
 
@@ -299,6 +326,24 @@ public DoFinalCheck()
 public OnPGNotify(connection, const channel[], const payload[])
 {
 	printf("[PGStream] PASS NOTIFY: conn=%d channel='%s' payload='%s'", connection, channel, payload);
+	if (strcmp(payload, "after_reconnect") == 0)
+	{
+		print("[PGStream] PASS RESTORE-LISTEN: LISTEN restored automatically after reconnect");
+	}
+}
+
+public OnPreparedReady(connection, bool:success)
+{
+	printf("[PGStream] OnPreparedReady: success=%d", _:success);
+	if (!success)
+	{
+		new err[128];
+		PG_GetError(connection, err, sizeof(err));
+		printf("[PGStream] FAIL: Prepare 'sel_count' failed: '%s'", err);
+		return 1;
+	}
+	print("[PGStream] PASS: Prepared stored ('sel_count')");
+	return 1;
 }
 
 public OnFinalCheck(connection, result, extra)
@@ -308,12 +353,59 @@ public OnFinalCheck(connection, result, extra)
 	printf("[PGStream] PASS: Total rows in pgstream_test: %s", cnt);
 	PG_FreeResult(result);
 
-	// Cleanup test table
-	PG_AsyncQuery(connection, "DROP TABLE IF EXISTS pgstream_test", "");
+	// T7: Prepare sel_count sebelum self-kill — supervisor akan re-prepare ulang
+	// statement ini setelah reconnect (restore session), jadi statement hidup lagi.
+	PG_Prepare(g_conn, "sel_count", "SELECT COUNT(*) AS cnt FROM pgstream_test", "OnPreparedReady");
+
+	// Test 13: Auto-reconnect — backend bunuh diri sendiri -> socket EOF ->
+	// plugin harus reconnect pada handle yang sama.
+	print("[PGStream] TEST Self-terminate backend (reconnect test)...");
+	g_CheckTimer = SetTimer("CheckReconnect", 2000, true);
+	PG_AsyncQuery(connection, "SELECT pg_terminate_backend(pg_backend_pid())", "OnSelfKill");
+	return 1;
+}
+
+public OnSelfKill(connection, result, extra)
+{
+	printf("[PGStream] Self-terminate query selesai (rows=%d) — menunggu reconnect", PG_NumRows(result));
+	PG_FreeResult(result);
+	return 1;
+}
+
+public CheckReconnect()
+{
+	if (g_ReconnectDone)
+	{
+		KillTimer(g_CheckTimer); // SetTimer interval 0 tidak menghentikan timer repeat
+		g_CheckTimer = -1;
+		return 1;
+	}
+	printf("[PGStream] TEST Menunggu reconnect (connect count=%d)", g_ConnectCount);
+	return 1;
+}
+
+public OnRestoredPrepared(connection, result, extra)
+{
+	new rows = PG_NumRows(result);
+	new cnt[16];
+	PG_GetStringByName(result, 0, "cnt", cnt, sizeof(cnt));
+	printf("[PGStream] PASS RESTORE-PREPARED: rows=%d cnt=%s", rows, cnt);
+	PG_FreeResult(result);
+
+	// T7: DROP dipindah ke sini, setelah restore test selesai (urut).
+	PG_AsyncQuery(connection, "DROP TABLE IF EXISTS pgstream_test", "OnDropDone");
+	return 1;
+}
+
+public OnDropDone(connection, result, extra)
+{
+	printf("[PGStream] Test table dropped (affected=%d)", PG_GetAffectedRows(result));
+	PG_FreeResult(result);
 
 	printf("[PGStream] IsConnected: %d", PG_IsConnected(connection));
 	PG_Close(connection);
 	printf("[PGStream] Connection closed. IsConnected: %d", PG_IsConnected(connection));
 
 	print("[PGStream] === ALL INTEGRATION TESTS COMPLETED ===");
+	return 1;
 }
