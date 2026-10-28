@@ -1,6 +1,6 @@
 # PGStream
 
-Plugin PostgreSQL native untuk SA:MP, ditulis dalam Rust. **Versi 0.3.0** (auto-reconnect + keepalive; di atas 0.2.x hardening TLS, v0.1.0 awal M0).
+Plugin PostgreSQL native untuk SA:MP, ditulis dalam Rust. **Versi 0.3.1** (auto-reconnect + keepalive; di atas 0.2.x hardening TLS, v0.1.0 awal M0).
 
 - Target: Windows x86 32-bit (`cdylib`), output `pgstream.dll` (PE32).
 - Koneksi via `tokio-postgres` + `rustls` — tanpa dependensi libpq.
@@ -263,7 +263,7 @@ Tiap koneksi (management oleh `handles.rs`: `CONNECTIONS`, `RESULTS`) menjalanka
 
 - **Multi-statement tidak didukung** — satu statement per panggilan `PG_AsyncQuery`/`PG_ExecutePrepared`; string yang berisi beberapa statement berbalik error dan tidak dieksekusi (sebagian maupun keseluruhan).
 - **Transaksi yang sedang berjalan hilang saat reconnect** — transaksi terbuka hidup di sesi yang mati; server melakukan rollback. Setelah reconnect, gamemode harus mengeluarkan `PG_Begin` lagi (momen yang tepat: callback connect `success=true`).
-- **Native query/transaksi/listen/prepare di-skip saat reconnect** — selama status `Connecting`, native `PG_AsyncQuery`/`PG_Begin`/`PG_Commit`/`PG_Rollback`/`PG_Listen`/`PG_Prepare` mengembalikan `0` **tanpa memanggil callback** (client tidak ada). Gamemode yang menunggu callback akan diam selama outage (bisa menit); tunda query hingga callback connect `success=1` terpanggil kembali. Detail: [docs/API.md](docs/API.md).
+- **Callback saat reconnect** — selama status `Connecting`, native `PG_AsyncQuery`/`PG_Begin`/`PG_Commit`/`PG_Rollback`/`PG_Listen`/`PG_Prepare`/`PG_ExecutePrepared` mengembalikan `0` tapi tetap memanggil callback dengan `success=0` (client tidak ada — perintah di-skip). Gamemode bisa memakai ini untuk menunda kerja hingga `OnDBConnect(success=1)` berikutnya. Detail: [docs/API.md](docs/API.md).
 - **`PG_FreeResult` wajib dipanggil** — result tidak dibebaskan otomatis; setiap result yang masuk ke callback query harus di-free (sukses maupun gagal) supaya memori tidak menumpuk.
 - **Timeout statement/queue tidak mencakup antre lock** — `query_timeout_seconds` hanya berlaku selama eksekusi query; waktu menunggu giliran lock koneksi (query lain masih jalan) tidak dihitung terhadap timeout.
 - Tipe kolom belum didukung: `NUMERIC`, `UUID`, `JSON`/`JSONB`, `BYTEA`. Baca via `PG_GetString` tidak dijamin.

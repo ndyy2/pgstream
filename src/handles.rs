@@ -24,6 +24,6 @@ pub fn next_result_id() -> i32 {
 }
 
 pub fn free_result(id: i32) -> bool {
-    let mut map = RESULTS.lock().unwrap();
+    let mut map = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
     map.remove(&id).is_some()
 }

@@ -1,5 +1,16 @@
 # CHANGELOG — PGStream
 
+## [0.3.1] — 2026-10-28
+
+### Diperbaiki
+
+- **Callback saat reconnecting** — `PG_AsyncQuery`/`PG_ExecutePrepared`/`PG_Begin`/`PG_Commit`/`PG_Rollback`/`PG_Listen`/`PG_Prepare` yang dipanggil saat koneksi sedang reconnecting (`status=Connecting`) kini menembakkan callback `success=0` (bukan peluru diam) — gamemode mendeteksi downtime dan tidak menunggu callback yang tidak pernah datang. `PG_Notify` tetap return 0 tanpa callback (tidak punya callback).
+- **Poison-safe mutex** — semua `CONNECTIONS`/`RESULTS` `.lock().unwrap()` diganti `.lock().unwrap_or_else(|e| e.into_inner())`: akses tetap berfungsi bila mutex poisoned (crash di thread lain sepanjang runtime gas), tidak lagi bisa crash host thread SA:MP.
+
+### Versi
+
+- `PGSTREAM_VERSION` 300 → 301; `VERSION_CODE` 301; `PG_Version()` → `"PGStream 0.3.1"`; `Cargo.toml` 0.3.1.
+
 ## [0.3.0] — 2026-10-28
 
 Supervisor per handle: koneksi yang mati dideteksi (EOF socket / keepalive), lalu connect ulang dengan backoff eksponensial. Versi: `PGSTREAM_VERSION` = `300`, `VERSION_CODE` = `300`, `PG_Version()` → `"PGStream 0.3.0"`, `Cargo.toml` `0.3.0`.

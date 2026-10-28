@@ -1,4 +1,4 @@
-# PGStream API Reference (v0.3.0)
+# PGStream API Reference (v0.3.1)
 
 Semua native dideklarasikan di `pawn/include/pgstream.inc`. Versi plugin yang bisa dicek runtime: `PGSTREAM_VERSION` = `300`, string versi via `PG_Version`.
 
@@ -22,7 +22,7 @@ Parameter query memakai placeholder PostgreSQL `$1, $2, ...` sesuai urutan kode 
 native PG_Version(dest[], size = sizeof(dest));
 ```
 
-Mengisi `dest` dengan teks versi plugin (mis. `"PGStream 0.3.0"`) dan me-return kode versi integer (`300` untuk v0.3.0).
+Mengisi `dest` dengan teks versi plugin (mis. `"PGStream 0.3.1"`) dan me-return kode versi integer (`301` untuk v0.3.1).
 
 ```pawn
 new version[64];
@@ -115,7 +115,7 @@ Return `true` hanya bila koneksi benar-benar hidup.
 - `false` saat handle sedang `Connecting` (auto-reconnect berjalan), `Failed` (outage dengan `database.reconnect_enabled = false`), `Disconnected`, atau handle sudah ditutup.
 - Sejak v0.3.0 socket EOF/error langsung mengubah status, jadi `PG_IsConnected` tidak lagi melaporkan `Connected` untuk koneksi yang sudah tertutup.
 
-Selama handle sedang reconnecting (status `Connecting`), native `PG_AsyncQuery`/`PG_ExecutePrepared`/`PG_Begin`/`PG_Commit`/`PG_Rollback`/`PG_Listen`/`PG_Prepare` pada handle tersebut **mengembalikan `0` tanpa memanggil callback**: client tidak ada di registry, jadi perintahnya tidak dieksekusi sama sekali. Gamemode yang menunggu callback akan diam selama outage (bisa menit) — tunda query hingga callback connect `success=1` terpanggil kembali. Tidak ada antrean query otomatis selama reconnect.
+Selama handle sedang reconnecting (status `Connecting`), native `PG_AsyncQuery`/`PG_ExecutePrepared`/`PG_Begin`/`PG_Commit`/`PG_Rollback`/`PG_Listen`/`PG_Prepare` pada handle tersebut **memanggil callback dengan `success=0`** (sejak v0.3.1): perintahnya tidak dieksekusi sekali pun, tapi gamemode mendapat sinyal kegagalan alih-alih diam menunggu. `PG_IsConnected` = `false`, `PG_GetError` membaca `connection unavailable, reconnecting`. Tunda query hingga callback connect `success=1` terpanggil kembali. Tidak ada antrean query otomatis selama reconnect; `PG_Notify` tetap return `0` tanpa callback (tidak punya callback).
 
 ## PG_GetError
 

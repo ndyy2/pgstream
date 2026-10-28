@@ -44,8 +44,8 @@ pub fn logprintf(msg: &str) {
     }
 }
 
-pub const VERSION_CODE: Cell = 300;
-pub const VERSION_TEXT: &str = "PGStream 0.3.0";
+pub const VERSION_CODE: Cell = 301;
+pub const VERSION_TEXT: &str = "PGStream 0.3.1";
 
 // ---------------------------------------------------------------------------
 // TLS
@@ -401,10 +401,33 @@ async fn execute_query_internal<T: tokio_postgres::ToStatement + Sync + ?Sized>(
 }
 
 fn get_client_arc(conn_id: i32) -> Option<Arc<AsyncMutex<tokio_postgres::Client>>> {
-    let conns = CONNECTIONS.lock().unwrap();
+    let conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
     match conns.get(&conn_id) {
         Some(c) if c.status == ConnectionStatus::Connected => c.client.clone(),
         _ => None,
+    }
+}
+
+/// Request rejected while the client is unavailable (e.g. `Connecting` during
+/// a backoff loop). Instead of returning 0 silently, the pending callback is
+/// fired with success=0 so a gamemode is never left waiting through an outage.
+fn reject_unavailable(conn_id: i32, api: &str, callback: String) {
+    {
+        let mut conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = conns.get_mut(&conn_id) {
+            c.last_error = Some("connection unavailable, reconnecting".into());
+        }
+    }
+    logprintf(&format!(
+        "[PGStream] {} skipped on conn {} — connection unavailable, reconnecting",
+        api, conn_id
+    ));
+    if !callback.is_empty() {
+        runtime::send_completion(CompletionEvent::CommandFinished {
+            conn_id,
+            success: false,
+            callback,
+        });
     }
 }
 
@@ -558,7 +581,7 @@ unsafe extern "C" fn pg_version(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
 /// Registers a connection handle, enforcing the configured max active connections.
 /// On rejection a `Failed` handle is stored so `PG_GetError` still reports the reason.
 pub fn try_register_connection(conn_id: i32, max_size: usize) -> Result<(), String> {
-    let mut conns = CONNECTIONS.lock().unwrap();
+    let mut conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
     let active = conns
         .values()
         .filter(|c| {
@@ -584,7 +607,7 @@ pub fn try_register_connection(conn_id: i32, max_size: usize) -> Result<(), Stri
 fn fail_connect(conn_id: i32, callback: &str, msg: &str) {
     logprintf(&format!("[PGStream] Connect failed: {}", msg));
     {
-        let mut conns = CONNECTIONS.lock().unwrap();
+        let mut conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = conns.get_mut(&conn_id) {
             c.status = ConnectionStatus::Failed;
             c.last_error = Some(msg.to_string());
@@ -669,12 +692,15 @@ fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
 /// True while the handle is still registered (a `PG_Close` removes it and the
 /// supervisor must stop reconnecting).
 pub fn handle_exists(conn_id: i32) -> bool {
-    CONNECTIONS.lock().unwrap().contains_key(&conn_id)
+    CONNECTIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&conn_id)
 }
 
 /// Drops a connection handle. Returns true when a handle was removed.
 pub fn close_connection(conn_id: i32) -> bool {
-    let mut conns = CONNECTIONS.lock().unwrap();
+    let mut conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
     match conns.remove(&conn_id) {
         Some(mut c) => {
             c.status = ConnectionStatus::Disconnected;
@@ -815,7 +841,7 @@ async fn supervise(conn_id: i32, conn_str: String, callback: String) {
                 let mut send_ok = false;
                 let mut handle_missing = false;
                 {
-                    let mut conns = CONNECTIONS.lock().unwrap();
+                    let mut conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
                     match conns.get_mut(&conn_id) {
                         Some(c) => {
                             if reason.is_none() {
@@ -913,7 +939,7 @@ async fn supervise(conn_id: i32, conn_str: String, callback: String) {
                 let _ = pump.await;
 
                 {
-                    let mut conns = CONNECTIONS.lock().unwrap();
+                    let mut conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(c) = conns.get_mut(&conn_id) {
                         // Slot stays reserved (status Connecting) so the
                         // max_size cap stays honest while reconnecting.
@@ -939,7 +965,7 @@ async fn supervise(conn_id: i32, conn_str: String, callback: String) {
                         conn_id, reason
                     ));
                     {
-                        let mut conns = CONNECTIONS.lock().unwrap();
+                        let mut conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(c) = conns.get_mut(&conn_id) {
                             c.status = ConnectionStatus::Failed;
                         }
@@ -959,7 +985,7 @@ async fn supervise(conn_id: i32, conn_str: String, callback: String) {
             Err(e) => {
                 let chain = error_chain(&e);
                 {
-                    let mut conns = CONNECTIONS.lock().unwrap();
+                    let mut conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(c) = conns.get_mut(&conn_id) {
                         c.status = ConnectionStatus::Connecting;
                         c.last_error = Some(chain.clone());
@@ -981,7 +1007,7 @@ async fn supervise(conn_id: i32, conn_str: String, callback: String) {
                 }
                 if !reconnect_enabled {
                     {
-                        let mut conns = CONNECTIONS.lock().unwrap();
+                        let mut conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(c) = conns.get_mut(&conn_id) {
                             c.status = ConnectionStatus::Failed;
                         }
@@ -1014,7 +1040,7 @@ fn poll_death(death_rx: &mut tokio::sync::mpsc::Receiver<String>) -> Option<Stri
 /// failed LISTEN).
 async fn restore_session(conn_id: i32, client: &Arc<AsyncMutex<tokio_postgres::Client>>) -> usize {
     let (sqls, channels) = {
-        let conns = CONNECTIONS.lock().unwrap();
+        let conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
         match conns.get(&conn_id) {
             Some(c) => (c.prepared_sqls.clone(), c.listen_channels.clone()),
             None => return 0,
@@ -1071,7 +1097,7 @@ async fn restore_session(conn_id: i32, client: &Arc<AsyncMutex<tokio_postgres::C
     }
     drop(lock);
 
-    let mut conns = CONNECTIONS.lock().unwrap();
+    let mut conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(c) = conns.get_mut(&conn_id) {
         // Merge per entry: statements that failed to re-prepare are dropped
         // (they would be dead), the rest are replaced by the fresh ones.
@@ -1116,7 +1142,7 @@ unsafe extern "C" fn pg_is_connected(_amx_ptr: *mut Amx, params: *mut Cell) -> C
     let Some(conn_id) = amx::native_arg(params, 1) else {
         return 0;
     };
-    let conns = CONNECTIONS.lock().unwrap();
+    let conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
     match conns.get(&conn_id) {
         Some(c) if c.status == ConnectionStatus::Connected => 1,
         _ => 0,
@@ -1143,10 +1169,7 @@ unsafe extern "C" fn pg_async_query(amx_ptr: *mut Amx, params: *mut Cell) -> Cel
     };
 
     let Some(client) = get_client_arc(conn_id) else {
-        logprintf(&format!(
-            "[PGStream] Error: connection {} not connected for query",
-            conn_id
-        ));
+        reject_unavailable(conn_id, "Query", callback);
         return 0;
     };
 
@@ -1156,7 +1179,7 @@ unsafe extern "C" fn pg_async_query(amx_ptr: *mut Amx, params: *mut Cell) -> Cel
         let lock = client.lock().await;
         let res = execute_query_internal(&lock, &query_str, &sql_params).await;
         {
-            let mut results = RESULTS.lock().unwrap();
+            let mut results = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
             results.insert(result_id, res);
         }
         runtime::send_completion(CompletionEvent::QueryFinished {
@@ -1195,6 +1218,7 @@ unsafe fn tx_command(amx_ptr: *mut Amx, params: *mut Cell, sql: &str) -> Cell {
     };
     let callback = read_string_arg(amx_ptr, params, 2).unwrap_or_default();
     let Some(client) = get_client_arc(conn_id) else {
+        reject_unavailable(conn_id, sql, callback);
         return 0;
     };
 
@@ -1243,6 +1267,7 @@ unsafe extern "C" fn pg_listen(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
         return 0;
     }
     let Some(client) = get_client_arc(conn_id) else {
+        reject_unavailable(conn_id, "LISTEN", callback);
         return 0;
     };
 
@@ -1257,7 +1282,7 @@ unsafe extern "C" fn pg_listen(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
             ));
         } else {
             {
-                let mut conns = CONNECTIONS.lock().unwrap();
+                let mut conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(c) = conns.get_mut(&conn_id) {
                     c.record_listen(&channel);
                 }
@@ -1293,6 +1318,7 @@ unsafe extern "C" fn pg_notify(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
         return 0;
     }
     let Some(client) = get_client_arc(conn_id) else {
+        reject_unavailable(conn_id, "NOTIFY", String::new());
         return 0;
     };
 
@@ -1326,6 +1352,7 @@ unsafe extern "C" fn pg_prepare(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
     let query = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
     let callback = read_string_arg(amx_ptr, params, 4).unwrap_or_default();
     let Some(client) = get_client_arc(conn_id) else {
+        reject_unavailable(conn_id, &format!("PREPARE '{}'", stmt_name), callback);
         return 0;
     };
 
@@ -1334,7 +1361,7 @@ unsafe extern "C" fn pg_prepare(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
         match lock.prepare(&query).await {
             Ok(stmt) => {
                 {
-                    let mut conns = CONNECTIONS.lock().unwrap();
+                    let mut conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(c) = conns.get_mut(&conn_id) {
                         // T4: a `Statement` is bound to the client that made
                         // it — if a reconnect swapped the client meanwhile,
@@ -1364,7 +1391,7 @@ unsafe extern "C" fn pg_prepare(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
             Err(e) => {
                 logprintf(&format!("[PGStream] Prepare '{}' failed: {}", stmt_name, e));
                 {
-                    let mut conns = CONNECTIONS.lock().unwrap();
+                    let mut conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(c) = conns.get_mut(&conn_id) {
                         c.last_error = Some(e.to_string());
                     }
@@ -1398,7 +1425,7 @@ unsafe extern "C" fn pg_execute_prepared(amx_ptr: *mut Amx, params: *mut Cell) -
     };
 
     let (client, stmt) = {
-        let conns = CONNECTIONS.lock().unwrap();
+        let conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
         match conns.get(&conn_id) {
             Some(c) if c.status == ConnectionStatus::Connected => {
                 match c.prepared_statements.get(&stmt_name) {
@@ -1415,7 +1442,10 @@ unsafe extern "C" fn pg_execute_prepared(amx_ptr: *mut Amx, params: *mut Cell) -
                     }
                 }
             }
-            _ => return 0,
+            _ => {
+                reject_unavailable(conn_id, "ExecutePrepared", callback);
+                return 0;
+            }
         }
     };
 
@@ -1426,7 +1456,7 @@ unsafe extern "C" fn pg_execute_prepared(amx_ptr: *mut Amx, params: *mut Cell) -
         let res = execute_query_internal(&lock, &stmt, &sql_params).await;
 
         {
-            let mut results = RESULTS.lock().unwrap();
+            let mut results = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
             results.insert(result_id, res);
         }
 
@@ -1449,7 +1479,7 @@ unsafe extern "C" fn pg_num_rows(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell 
     let Some(result_id) = amx::native_arg(params, 1) else {
         return 0;
     };
-    let res_map = RESULTS.lock().unwrap();
+    let res_map = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
     res_map
         .get(&result_id)
         .map(|r| r.rows.len() as Cell)
@@ -1460,7 +1490,7 @@ unsafe extern "C" fn pg_num_fields(_amx_ptr: *mut Amx, params: *mut Cell) -> Cel
     let Some(result_id) = amx::native_arg(params, 1) else {
         return 0;
     };
-    let res_map = RESULTS.lock().unwrap();
+    let res_map = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
     res_map
         .get(&result_id)
         .map(|r| r.columns.len() as Cell)
@@ -1471,7 +1501,7 @@ unsafe extern "C" fn pg_get_affected_rows(_amx_ptr: *mut Amx, params: *mut Cell)
     let Some(result_id) = amx::native_arg(params, 1) else {
         return 0;
     };
-    let res_map = RESULTS.lock().unwrap();
+    let res_map = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
     res_map
         .get(&result_id)
         .map(|r| r.rows_affected as Cell)
@@ -1484,7 +1514,7 @@ unsafe extern "C" fn pg_get_string(amx_ptr: *mut Amx, params: *mut Cell) -> Cell
     };
     let row = amx::native_arg(params, 2).unwrap_or(0) as usize;
     let col = amx::native_arg(params, 3).unwrap_or(0) as usize;
-    let res_map = RESULTS.lock().unwrap();
+    let res_map = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
     let text = res_map
         .get(&result_id)
         .and_then(|r| r.get_value(row, col))
@@ -1498,7 +1528,7 @@ unsafe extern "C" fn pg_get_int(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
     };
     let row = amx::native_arg(params, 2).unwrap_or(0) as usize;
     let col = amx::native_arg(params, 3).unwrap_or(0) as usize;
-    let res_map = RESULTS.lock().unwrap();
+    let res_map = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
     res_map
         .get(&result_id)
         .and_then(|r| r.get_value(row, col))
@@ -1512,7 +1542,7 @@ unsafe extern "C" fn pg_get_float(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell
     };
     let row = amx::native_arg(params, 2).unwrap_or(0) as usize;
     let col = amx::native_arg(params, 3).unwrap_or(0) as usize;
-    let res_map = RESULTS.lock().unwrap();
+    let res_map = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
     let f = res_map
         .get(&result_id)
         .and_then(|r| r.get_value(row, col))
@@ -1527,7 +1557,7 @@ unsafe extern "C" fn pg_is_null(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
     };
     let row = amx::native_arg(params, 2).unwrap_or(0) as usize;
     let col = amx::native_arg(params, 3).unwrap_or(0) as usize;
-    let res_map = RESULTS.lock().unwrap();
+    let res_map = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
     if res_map
         .get(&result_id)
         .map(|r| r.is_null(row, col))
@@ -1544,7 +1574,7 @@ unsafe extern "C" fn pg_field_name(amx_ptr: *mut Amx, params: *mut Cell) -> Cell
         return 0;
     };
     let col = amx::native_arg(params, 2).unwrap_or(0) as usize;
-    let res_map = RESULTS.lock().unwrap();
+    let res_map = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
     let name = res_map
         .get(&result_id)
         .and_then(|r| r.columns.get(col))
@@ -1559,7 +1589,7 @@ unsafe extern "C" fn pg_get_string_by_name(amx_ptr: *mut Amx, params: *mut Cell)
     };
     let row = amx::native_arg(params, 2).unwrap_or(0) as usize;
     let col_name = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
-    let res_map = RESULTS.lock().unwrap();
+    let res_map = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
     let col_idx = res_map
         .get(&result_id)
         .and_then(|r| r.get_col_index(&col_name));
@@ -1579,7 +1609,7 @@ unsafe extern "C" fn pg_get_int_by_name(amx_ptr: *mut Amx, params: *mut Cell) ->
     };
     let row = amx::native_arg(params, 2).unwrap_or(0) as usize;
     let col_name = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
-    let res_map = RESULTS.lock().unwrap();
+    let res_map = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
     let col_idx = res_map
         .get(&result_id)
         .and_then(|r| r.get_col_index(&col_name));
@@ -1599,7 +1629,7 @@ unsafe extern "C" fn pg_get_float_by_name(amx_ptr: *mut Amx, params: *mut Cell) 
     };
     let row = amx::native_arg(params, 2).unwrap_or(0) as usize;
     let col_name = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
-    let res_map = RESULTS.lock().unwrap();
+    let res_map = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
     let col_idx = res_map
         .get(&result_id)
         .and_then(|r| r.get_col_index(&col_name));
@@ -1620,7 +1650,7 @@ unsafe extern "C" fn pg_is_null_by_name(amx_ptr: *mut Amx, params: *mut Cell) ->
     };
     let row = amx::native_arg(params, 2).unwrap_or(0) as usize;
     let col_name = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
-    let res_map = RESULTS.lock().unwrap();
+    let res_map = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
     let col_idx = res_map
         .get(&result_id)
         .and_then(|r| r.get_col_index(&col_name));
@@ -1655,7 +1685,7 @@ unsafe extern "C" fn pg_get_error(amx_ptr: *mut Amx, params: *mut Cell) -> Cell 
     let Some(conn_id) = amx::native_arg(params, 1) else {
         return 0;
     };
-    let conns = CONNECTIONS.lock().unwrap();
+    let conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
     let err = conns
         .get(&conn_id)
         .and_then(|c| c.last_error.as_deref())
