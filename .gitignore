@@ -1,0 +1,6 @@
+/target
+Cargo.lock.bak
+*.dll
+*.so
+*.amx
+pawn/tests/*.amx
