@@ -61,6 +61,82 @@ pub fn dispatch_callback(name: &str, args: &[Cell]) {
     }
 }
 
+/// Dispatches a public callback whose arguments may include strings.
+/// `Str` args are pushed as AMX heap strings (and released after exec);
+/// `Cell` args are pushed as plain cells.
+pub fn dispatch_callback_mixed(name: &str, args: &[crate::runtime::ExtraArg]) {
+    use crate::runtime::ExtraArg;
+
+    if name.is_empty() {
+        return;
+    }
+
+    let Ok(c_name) = CString::new(name) else {
+        return;
+    };
+
+    let find_public: Option<amx::AmxFindPublicFn> =
+        unsafe { plugin::table_fn(amx::slot::FIND_PUBLIC) };
+    let push_fn: Option<amx::AmxPushFn> = unsafe { plugin::table_fn(amx::slot::PUSH) };
+    let push_string: Option<amx::AmxPushStringFn> =
+        unsafe { plugin::table_fn(amx::slot::PUSH_STRING) };
+    let exec_fn: Option<amx::AmxExecFn> = unsafe { plugin::table_fn(amx::slot::EXEC) };
+    let release_fn: Option<amx::AmxReleaseFn> = unsafe { plugin::table_fn(amx::slot::RELEASE) };
+
+    let (Some(find_public), Some(push_fn), Some(push_string), Some(exec_fn), Some(release_fn)) =
+        (find_public, push_fn, push_string, exec_fn, release_fn)
+    else {
+        return;
+    };
+
+    let instances: Vec<usize> = {
+        let set = AMX_INSTANCES.lock().unwrap();
+        set.iter().copied().collect()
+    };
+
+    for amx_addr in instances {
+        let amx_ptr = amx_addr as *mut Amx;
+        let mut idx: c_int = 0;
+        let err = unsafe { find_public(amx_ptr, c_name.as_ptr(), &mut idx) };
+        if err == amx::AMX_ERR_NONE {
+            // Push right-to-left; heap addresses of pushed strings are
+            // collected so they can be released after the call.
+            let mut heap_addrs: Vec<Cell> = Vec::new();
+            unsafe {
+                for arg in args.iter().rev() {
+                    match arg {
+                        ExtraArg::Cell(v) => {
+                            push_fn(amx_ptr, *v);
+                        }
+                        ExtraArg::Str(s) => {
+                            let Ok(c_str) = CString::new(s.as_str()) else {
+                                continue;
+                            };
+                            let mut heap_addr: Cell = 0;
+                            push_string(
+                                amx_ptr,
+                                &mut heap_addr,
+                                std::ptr::null_mut(),
+                                c_str.as_ptr(),
+                                0,
+                                0,
+                            );
+                            if heap_addr != 0 {
+                                heap_addrs.push(heap_addr);
+                            }
+                        }
+                    }
+                }
+                let mut retval: Cell = 0;
+                exec_fn(amx_ptr, &mut retval, idx);
+                for addr in heap_addrs {
+                    release_fn(amx_ptr, addr);
+                }
+            }
+        }
+    }
+}
+
 /// Dispatches a notification event to Pawn callback `OnPGNotify(connection, const channel[], const payload[])`.
 pub fn dispatch_notification(conn_id: Cell, channel: &str, payload: &str) {
     let Ok(c_name) = CString::new("OnPGNotify") else {

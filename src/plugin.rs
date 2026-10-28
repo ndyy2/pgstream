@@ -1,5 +1,7 @@
 //! Plugin lifecycle, native registration, and SA:MP/Pawn boundary for PGStream.
 
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::str::FromStr;
@@ -19,6 +21,11 @@ use crate::runtime::{self, CompletionEvent};
 
 static AMX_TABLE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static LOGPRINTF: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+
+/// Result id exposed as the "active cache" during a PG_TQuery callback
+/// dispatch, or right after PG_SyncQuery. Main-thread only (ProcessTick /
+/// natives).
+static ACTIVE_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 pub(crate) unsafe fn table_fn<T: Copy>(idx: usize) -> Option<T> {
     let table = AMX_TABLE.load(Ordering::Relaxed);
@@ -179,6 +186,7 @@ pub extern "system" fn ProcessTick() {
             } => {
                 let s: Cell = if success { 1 } else { 0 };
                 callbacks::dispatch_callback(&callback, &[conn_id, s]);
+                flush_pending(conn_id);
             }
             CompletionEvent::QueryFinished {
                 conn_id,
@@ -187,6 +195,47 @@ pub extern "system" fn ProcessTick() {
                 extra,
             } => {
                 callbacks::dispatch_callback(&callback, &[conn_id, result_id, extra]);
+            }
+            CompletionEvent::QueryFinishedExtras {
+                conn_id,
+                result_id,
+                callback,
+                query,
+                extras,
+            } => {
+                // mysql_tquery compat: expose the result as the "active cache"
+                // for the duration of the dispatch, fire OnQueryError on SQL
+                // errors, then free the result automatically.
+                ACTIVE_RESULT.store(result_id, Ordering::Relaxed);
+                let had_error = {
+                    let results = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+                    results
+                        .get(&result_id)
+                        .map(|r| r.error.is_some())
+                        .unwrap_or(true)
+                };
+                if had_error {
+                    let err = {
+                        let results = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+                        results
+                            .get(&result_id)
+                            .and_then(|r| r.error.clone())
+                            .unwrap_or_else(|| "unknown query error".into())
+                    };
+                    callbacks::dispatch_callback_mixed(
+                        "OnQueryError",
+                        &[
+                            runtime::ExtraArg::Cell(0),
+                            runtime::ExtraArg::Str(err),
+                            runtime::ExtraArg::Str(callback.clone()),
+                            runtime::ExtraArg::Str(query),
+                            runtime::ExtraArg::Cell(conn_id),
+                        ],
+                    );
+                }
+                callbacks::dispatch_callback_mixed(&callback, &extras);
+                ACTIVE_RESULT.store(0, Ordering::Relaxed);
+                handles::free_result(result_id);
             }
             CompletionEvent::CommandFinished {
                 conn_id,
@@ -447,7 +496,7 @@ fn escape_identifier(s: &str) -> String {
 // Native Callbacks Table
 // ---------------------------------------------------------------------------
 
-static PG_NATIVES: [amx::NativeInfo; 30] = [
+static PG_NATIVES: [amx::NativeInfo; 58] = [
     amx::NativeInfo {
         name: b"PG_Version\0".as_ptr() as *const c_char,
         func: Some(pg_version),
@@ -566,6 +615,120 @@ static PG_NATIVES: [amx::NativeInfo; 30] = [
     amx::NativeInfo {
         name: b"PG_ExecutePrepared\0".as_ptr() as *const c_char,
         func: Some(pg_execute_prepared),
+    },
+    // MySQL-compat layer (drop-in migration from pBlueG R41-4 gamemodes)
+    amx::NativeInfo {
+        name: b"PG_Format\0".as_ptr() as *const c_char,
+        func: Some(pg_format),
+    },
+    amx::NativeInfo {
+        name: b"PG_TQuery\0".as_ptr() as *const c_char,
+        func: Some(pg_tquery),
+    },
+    amx::NativeInfo {
+        name: b"PG_SyncQuery\0".as_ptr() as *const c_char,
+        func: Some(pg_sync_query),
+    },
+    amx::NativeInfo {
+        name: b"PG_ActiveResult\0".as_ptr() as *const c_char,
+        func: Some(pg_active_result),
+    },
+    // ---- pBlueG R41-4 API aliases (drop-in gamemode migration) ----
+    amx::NativeInfo {
+        name: b"mysql_init_options\0".as_ptr() as *const c_char,
+        func: Some(mysql_init_options),
+    },
+    amx::NativeInfo {
+        name: b"mysql_set_option\0".as_ptr() as *const c_char,
+        func: Some(mysql_set_option),
+    },
+    amx::NativeInfo {
+        name: b"mysql_connect\0".as_ptr() as *const c_char,
+        func: Some(mysql_connect),
+    },
+    amx::NativeInfo {
+        name: b"mysql_errno\0".as_ptr() as *const c_char,
+        func: Some(mysql_errno),
+    },
+    amx::NativeInfo {
+        name: b"mysql_close\0".as_ptr() as *const c_char,
+        func: Some(mysql_close),
+    },
+    amx::NativeInfo {
+        name: b"mysql_escape_string\0".as_ptr() as *const c_char,
+        func: Some(mysql_escape_string),
+    },
+    amx::NativeInfo {
+        name: b"mysql_format\0".as_ptr() as *const c_char,
+        func: Some(pg_format),
+    },
+    amx::NativeInfo {
+        name: b"mysql_tquery\0".as_ptr() as *const c_char,
+        func: Some(pg_tquery),
+    },
+    amx::NativeInfo {
+        name: b"mysql_pquery\0".as_ptr() as *const c_char,
+        func: Some(pg_tquery),
+    },
+    amx::NativeInfo {
+        name: b"mysql_query\0".as_ptr() as *const c_char,
+        func: Some(mysql_query),
+    },
+    amx::NativeInfo {
+        name: b"cache_num_rows\0".as_ptr() as *const c_char,
+        func: Some(cache_num_rows),
+    },
+    amx::NativeInfo {
+        name: b"cache_get_row_count\0".as_ptr() as *const c_char,
+        func: Some(cache_num_rows),
+    },
+    amx::NativeInfo {
+        name: b"cache_get_value_name\0".as_ptr() as *const c_char,
+        func: Some(cache_get_value_name),
+    },
+    amx::NativeInfo {
+        name: b"cache_get_value\0".as_ptr() as *const c_char,
+        func: Some(cache_get_value_name),
+    },
+    amx::NativeInfo {
+        name: b"cache_get_value_name_int\0".as_ptr() as *const c_char,
+        func: Some(cache_get_value_name_int),
+    },
+    amx::NativeInfo {
+        name: b"cache_get_value_int\0".as_ptr() as *const c_char,
+        func: Some(cache_get_value_name_int),
+    },
+    amx::NativeInfo {
+        name: b"cache_get_value_name_float\0".as_ptr() as *const c_char,
+        func: Some(cache_get_value_name_float),
+    },
+    amx::NativeInfo {
+        name: b"cache_get_value_float\0".as_ptr() as *const c_char,
+        func: Some(cache_get_value_name_float),
+    },
+    amx::NativeInfo {
+        name: b"cache_get_value_index\0".as_ptr() as *const c_char,
+        func: Some(cache_get_value_index),
+    },
+    amx::NativeInfo {
+        name: b"cache_get_value_index_int\0".as_ptr() as *const c_char,
+        func: Some(cache_get_value_index_int),
+    },
+    amx::NativeInfo {
+        name: b"cache_insert_id\0".as_ptr() as *const c_char,
+        func: Some(cache_insert_id),
+    },
+    amx::NativeInfo {
+        name: b"cache_save\0".as_ptr() as *const c_char,
+        func: Some(cache_save),
+    },
+    amx::NativeInfo {
+        name: b"cache_delete\0".as_ptr() as *const c_char,
+        func: Some(cache_delete),
+    },
+    amx::NativeInfo {
+        name: b"cache_affected_rows\0".as_ptr() as *const c_char,
+        func: Some(cache_affected_rows),
     },
     amx::NativeInfo {
         name: ptr::null(),
@@ -1305,6 +1468,598 @@ unsafe extern "C" fn pg_query_format(amx_ptr: *mut Amx, params: *mut Cell) -> Ce
     });
 
     result_id
+}
+
+// ---------------------------------------------------------------------------
+// MySQL-compat natives (pBlueG R41-4 drop-in migration)
+// ---------------------------------------------------------------------------
+
+/// Escape a string for interpolation into a SQL literal: with
+/// standard_conforming_strings only the quote itself needs doubling.
+fn sql_escape_literal(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// native PG_Format(connection, dest[], size = sizeof(dest), const fmt[], {Float,_}:...);
+///
+/// pBlueG `mysql_format` clone: interpolates `%d %i %s %f %e %x %X %c` (plus
+/// width/precision flags, e.g. `%.2f`) directly into the SQL text. `%e` is
+/// escaped for a SQL literal. The connection argument is accepted for
+/// signature compatibility but unused.
+unsafe extern "C" fn pg_format(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
+    let fmt = match read_string_arg(amx_ptr, params, 4) {
+        Some(f) => f,
+        None => return 0,
+    };
+
+    let get_addr = match table_fn::<amx::AmxGetAddrFn>(amx::slot::GET_ADDR) {
+        Some(f) => f,
+        None => return 0,
+    };
+
+    let mut out = String::with_capacity(fmt.len() + 32);
+    let mut arg_cursor: Cell = 5;
+    let mut chars = fmt.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            out.push(ch);
+            continue;
+        }
+        if chars.peek() == Some(&'%') {
+            chars.next();
+            out.push('%');
+            continue;
+        }
+        // Collect optional flags/width/precision (e.g. "-08.2").
+        let mut spec = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | ' ' | '#' | '*') {
+                spec.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let conv = match chars.next() {
+            Some(c) => c,
+            None => break,
+        };
+        let precision: Option<usize> = spec.split_once('.').and_then(|(_, frac)| frac.parse().ok());
+
+        let read_cell = |cursor: &mut Cell| -> Cell {
+            let addr = amx::native_arg(params, *cursor).unwrap_or(0);
+            *cursor += 1;
+            deref_vararg_cell(amx_ptr, addr, get_addr)
+        };
+
+        match conv {
+            'd' | 'i' => {
+                let v = read_cell(&mut arg_cursor);
+                out.push_str(&v.to_string());
+            }
+            'f' | 'g' => {
+                let bits = read_cell(&mut arg_cursor);
+                let v = f32::from_bits(bits as u32) as f64;
+                match precision {
+                    Some(p) => out.push_str(&format!("{:.*}", p, v)),
+                    None => out.push_str(&format!("{:.6}", v)),
+                }
+            }
+            's' => {
+                let s = read_string_arg(amx_ptr, params, arg_cursor).unwrap_or_default();
+                arg_cursor += 1;
+                out.push_str(&s);
+            }
+            'e' | 'q' => {
+                let s = read_string_arg(amx_ptr, params, arg_cursor).unwrap_or_default();
+                arg_cursor += 1;
+                out.push_str(&sql_escape_literal(&s));
+            }
+            'x' => {
+                let v = read_cell(&mut arg_cursor);
+                out.push_str(&format!("{:x}", v));
+            }
+            'X' => {
+                let v = read_cell(&mut arg_cursor);
+                out.push_str(&format!("{:X}", v));
+            }
+            'c' => {
+                let v = read_cell(&mut arg_cursor);
+                if let Some(c) = char::from_u32(v as u32) {
+                    out.push(c);
+                }
+            }
+            _ => {
+                // Unknown specifier: emit as-is, do not consume an argument.
+                out.push('%');
+                out.push_str(&spec);
+                out.push(conv);
+            }
+        }
+    }
+
+    write_string_dest(amx_ptr, params, 2, 3, &out)
+}
+
+/// Reads mysql_tquery-style extra args (format `d i f s b`) into ExtraArg
+/// values for callback dispatch.
+unsafe fn parse_variadic_extras(
+    amx_ptr: *mut Amx,
+    params: *mut Cell,
+    format: &str,
+    start_arg: Cell,
+) -> Vec<runtime::ExtraArg> {
+    use runtime::ExtraArg;
+
+    let mut extras: Vec<ExtraArg> = Vec::new();
+    let get_addr = match table_fn::<amx::AmxGetAddrFn>(amx::slot::GET_ADDR) {
+        Some(f) => f,
+        None => return extras,
+    };
+    let mut arg_cursor = start_arg;
+    for ch in format.chars() {
+        match ch {
+            'd' | 'i' | 'f' | 'b' => {
+                let addr = amx::native_arg(params, arg_cursor).unwrap_or(0);
+                extras.push(ExtraArg::Cell(deref_vararg_cell(amx_ptr, addr, get_addr)));
+                arg_cursor += 1;
+            }
+            's' => {
+                extras.push(ExtraArg::Str(
+                    read_string_arg(amx_ptr, params, arg_cursor).unwrap_or_default(),
+                ));
+                arg_cursor += 1;
+            }
+            _ => {}
+        }
+    }
+    extras
+}
+
+/// native PG_TQuery(connection, const query[], const callback[] = "", const format[] = "", {Float,_}:...);
+///
+/// pBlueG `mysql_tquery` clone: runs fully-interpolated SQL async, then calls
+/// `callback` with exactly the extra args described by `format`. During the
+/// dispatch `PG_ActiveResult()` exposes the result; it is freed automatically
+/// after the callback returns. SQL errors fire `OnQueryError`.
+unsafe extern "C" fn pg_tquery(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
+    let Some(conn_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
+    let query_str = read_string_arg(amx_ptr, params, 2).unwrap_or_default();
+    let callback = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
+    let format = read_string_arg(amx_ptr, params, 4).unwrap_or_default();
+
+    let extras = if format.is_empty() {
+        Vec::new()
+    } else {
+        parse_variadic_extras(amx_ptr, params, &format, 5)
+    };
+
+    dispatch_or_park(conn_id, query_str, callback, extras)
+}
+
+/// native PG_SyncQuery(connection, const query[]);
+///
+/// pBlueG `mysql_query` clone: blocking query returning a result handle. The
+/// result persists (is the active result) until PG_FreeResult — matching the
+/// Cache save/delete lifecycle. Blocks the main thread up to the configured
+/// query timeout.
+unsafe extern "C" fn pg_sync_query(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
+    use std::sync::mpsc::channel;
+
+    let Some(conn_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
+    let query_str = read_string_arg(amx_ptr, params, 2).unwrap_or_default();
+
+    let Some(client) = get_client_arc(conn_id) else {
+        logprintf(&format!(
+            "[PGStream] SyncQuery skipped on conn {conn_id} — connection unavailable"
+        ));
+        ACTIVE_RESULT.store(0, Ordering::Relaxed);
+        return 0;
+    };
+
+    let result_id = handles::next_result_id();
+    let (tx, rx) = channel();
+    let query_for_error = query_str.clone();
+
+    runtime::spawn(async move {
+        let lock = client.lock().await;
+        let res = execute_query_internal(&lock, &query_str, &[]).await;
+        drop(lock);
+        let _ = tx.send(res);
+    });
+
+    let timeout = config::query_timeout();
+    let res = match rx.recv_timeout(timeout + std::time::Duration::from_secs(1)) {
+        Ok(res) => res,
+        Err(_) => QueryResult::error(format!("Query timed out after {}s", timeout.as_secs())),
+    };
+
+    let had_error = res.error.is_some();
+    {
+        let mut results = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+        results.insert(result_id, res);
+    }
+    if had_error {
+        let err = {
+            let results = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+            results
+                .get(&result_id)
+                .and_then(|r| r.error.clone())
+                .unwrap_or_else(|| "unknown query error".into())
+        };
+        callbacks::dispatch_callback_mixed(
+            "OnQueryError",
+            &[
+                runtime::ExtraArg::Cell(0),
+                runtime::ExtraArg::Str(err),
+                runtime::ExtraArg::Str(String::new()),
+                runtime::ExtraArg::Str(query_for_error),
+                runtime::ExtraArg::Cell(conn_id),
+            ],
+        );
+    }
+
+    ACTIVE_RESULT.store(result_id, Ordering::Relaxed);
+    result_id
+}
+
+/// native PG_ActiveResult();
+///
+/// Returns the result id currently exposed as the "active cache" — set during
+/// a PG_TQuery callback dispatch or after PG_SyncQuery. 0 when none.
+unsafe extern "C" fn pg_active_result(_amx_ptr: *mut Amx, _params: *mut Cell) -> Cell {
+    ACTIVE_RESULT.load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// pBlueG R41-4 API aliases
+// ---------------------------------------------------------------------------
+
+/// A tquery-style query parked while its connection is `Connecting`; flushed
+/// (or failed) when the connection settles.
+struct PendingQuery {
+    query: String,
+    callback: String,
+    extras: Vec<runtime::ExtraArg>,
+}
+
+static PENDING: Lazy<Lock<HashMap<i32, Vec<PendingQuery>>>> =
+    Lazy::new(|| Lock::new(HashMap::new()));
+
+type Lock<T> = std::sync::Mutex<T>;
+
+/// Runs `run_query` if the connection is ready; otherwise parks it in the
+/// pending queue so callbacks are never dispatched with a wrong signature
+/// during an outage. Returns the reserved result id either way.
+fn dispatch_or_park(
+    conn_id: i32,
+    query: String,
+    callback: String,
+    extras: Vec<runtime::ExtraArg>,
+) -> i32 {
+    let result_id = handles::next_result_id();
+    let client = get_client_arc(conn_id);
+    let pending_now = client.is_none() && connection_is_connecting(conn_id);
+
+    if let Some(client) = client {
+        let query_for_task = query.clone();
+        let callback_for_task = callback.clone();
+        let extras_for_task = extras.clone();
+        runtime::spawn(async move {
+            let lock = client.lock().await;
+            let res = execute_query_internal(&lock, &query_for_task, &[]).await;
+            drop(lock);
+            {
+                let mut results = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+                results.insert(result_id, res);
+            }
+            runtime::send_completion(CompletionEvent::QueryFinishedExtras {
+                conn_id,
+                result_id,
+                callback: callback_for_task,
+                query,
+                extras: extras_for_task,
+            });
+        });
+    } else if pending_now {
+        let mut map = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(conn_id).or_default().push(PendingQuery {
+            query,
+            callback,
+            extras,
+        });
+    } else {
+        // Genuinely dead (reconnect disabled / closed): fail via OnQueryError.
+        logprintf(&format!(
+            "[PGStream] TQuery dropped on conn {conn_id} — connection unavailable"
+        ));
+        runtime::send_completion(CompletionEvent::QueryFinishedExtras {
+            conn_id,
+            result_id,
+            callback,
+            query,
+            extras,
+        });
+    }
+    result_id
+}
+
+fn connection_is_connecting(conn_id: i32) -> bool {
+    let conns = CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
+    conns
+        .get(&conn_id)
+        .map(|c| c.status == ConnectionStatus::Connecting)
+        .unwrap_or(false)
+}
+
+/// Flush the pending queue for a connection after it (re)connects, or fail
+/// every parked query when the connection is gone for good.
+pub fn flush_pending(conn_id: i32) {
+    let pending = {
+        let mut map = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(&conn_id).unwrap_or_default()
+    };
+    if pending.is_empty() {
+        return;
+    }
+    logprintf(&format!(
+        "[PGStream] Flushing {} queued quer{} on conn {}",
+        pending.len(),
+        if pending.len() == 1 { "y" } else { "ies" },
+        conn_id
+    ));
+    let ready = get_client_arc(conn_id).is_some();
+    for p in pending {
+        if ready {
+            dispatch_or_park(conn_id, p.query, p.callback, p.extras);
+        } else {
+            let result_id = handles::next_result_id();
+            {
+                let mut results = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+                results.insert(
+                    result_id,
+                    QueryResult::error("connection unavailable".into()),
+                );
+            }
+            runtime::send_completion(CompletionEvent::QueryFinishedExtras {
+                conn_id,
+                result_id,
+                callback: p.callback,
+                query: p.query,
+                extras: p.extras,
+            });
+        }
+    }
+}
+
+unsafe extern "C" fn mysql_init_options(_amx_ptr: *mut Amx, _params: *mut Cell) -> Cell {
+    1 // dummy option handle; options are no-ops under PGStream
+}
+
+unsafe extern "C" fn mysql_set_option(_amx_ptr: *mut Amx, _params: *mut Cell) -> Cell {
+    1
+}
+
+/// native MySQL:mysql_connect(const host[], const user[], const password[],
+///                             const database[], MySQLOpt:option_id, port = 5432)
+unsafe extern "C" fn mysql_connect(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
+    let host = read_string_arg(amx_ptr, params, 1).unwrap_or_default();
+    let user = read_string_arg(amx_ptr, params, 2).unwrap_or_default();
+    let pass = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
+    let db = read_string_arg(amx_ptr, params, 4).unwrap_or_default();
+    let port = amx::native_arg(params, 6).unwrap_or(5432).max(0) as u16;
+
+    let sslmode = config::Config::global().database.sslmode;
+    let cfg = format!(
+        "host={} port={} user={} password={} dbname={} sslmode={}",
+        host,
+        port,
+        user,
+        pass,
+        db,
+        sslmode.trim().to_ascii_lowercase()
+    );
+    spawn_connect(cfg, String::new())
+}
+
+/// native mysql_errno(MySQL:handle) — 0 when connected. Approximation: PG
+/// connects async, so errno is also nonzero while still connecting.
+unsafe extern "C" fn mysql_errno(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
+    let Some(conn_id) = amx::native_arg(params, 1) else {
+        return 1;
+    };
+    match get_client_arc(conn_id) {
+        Some(_) => 0,
+        None => 1,
+    }
+}
+
+unsafe extern "C" fn mysql_close(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
+    // Reuse pg_close, then drop any parked queries.
+    let ret = pg_close(std::ptr::null_mut(), params);
+    if let Some(conn_id) = amx::native_arg(params, 1) {
+        PENDING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&conn_id);
+    }
+    ret
+}
+
+/// native mysql_escape_string(MySQL:handle, const source[], destination[])
+unsafe extern "C" fn mysql_escape_string(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
+    let src = match read_string_arg(amx_ptr, params, 2) {
+        Some(s) => s,
+        None => return 0,
+    };
+    let escaped = sql_escape_literal(&src);
+    // No explicit destination size in the R41 signature: size the write from
+    // the destination array itself (arg 3) — write_string_dest needs a size
+    // param index; pass the escaped length so amx_SetString truncates safely.
+    write_string_dest(amx_ptr, params, 3, 3, &escaped)
+}
+
+unsafe extern "C" fn mysql_query(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
+    pg_sync_query(amx_ptr, params)
+}
+
+/// Writes `value` through a by-reference Pawn argument (e.g. `&dest`).
+unsafe fn write_cell_ref(amx_ptr: *mut Amx, params: *mut Cell, arg_idx: Cell, value: Cell) -> Cell {
+    let get_addr: amx::AmxGetAddrFn = match table_fn(amx::slot::GET_ADDR) {
+        Some(f) => f,
+        None => return amx::AMX_ERR_NATIVE,
+    };
+    let Some(addr) = amx::native_arg(params, arg_idx) else {
+        return amx::AMX_ERR_PARAMS;
+    };
+    let mut phys: *mut Cell = ptr::null_mut();
+    if get_addr(amx_ptr, addr, &mut phys) != amx::AMX_ERR_NONE || phys.is_null() {
+        return amx::AMX_ERR_NATIVE;
+    }
+    unsafe { *phys = value };
+    1
+}
+
+fn parse_cell_i64(s: Option<&str>) -> Cell {
+    s.and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+        .clamp(i32::MIN as i64, i32::MAX as i64) as Cell
+}
+
+fn parse_cell_f32bits(s: Option<&str>) -> Cell {
+    let v: f32 = s.and_then(|v| v.trim().parse().ok()).unwrap_or(0.0);
+    v.to_bits() as Cell
+}
+
+unsafe extern "C" fn cache_num_rows(_amx_ptr: *mut Amx, _params: *mut Cell) -> Cell {
+    let active = ACTIVE_RESULT.load(Ordering::Relaxed);
+    let results = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+    results
+        .get(&active)
+        .map(|r| r.rows.len() as Cell)
+        .unwrap_or(0)
+}
+
+/// cache_get_value_name(row, const field_name[], destination[], max_len)
+unsafe extern "C" fn cache_get_value_name(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
+    let row = amx::native_arg(params, 1).unwrap_or(0).max(0) as usize;
+    let field = read_string_arg(amx_ptr, params, 2).unwrap_or_default();
+    let active = ACTIVE_RESULT.load(Ordering::Relaxed);
+    let value = {
+        let results = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+        results.get(&active).and_then(|r| {
+            r.get_col_index(&field)
+                .and_then(|col| r.get_value(row, col))
+                .map(|s| s.to_string())
+        })
+    };
+    match value {
+        Some(v) => write_string_dest(amx_ptr, params, 3, 4, &v),
+        None => 0,
+    }
+}
+
+unsafe extern "C" fn cache_get_value_name_int(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
+    let row = amx::native_arg(params, 1).unwrap_or(0).max(0) as usize;
+    let field = read_string_arg(amx_ptr, params, 2).unwrap_or_default();
+    let active = ACTIVE_RESULT.load(Ordering::Relaxed);
+    let value = {
+        let results = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+        results.get(&active).and_then(|r| {
+            r.get_col_index(&field)
+                .and_then(|col| r.get_value(row, col))
+                .map(|s| s.to_string())
+        })
+    };
+    write_cell_ref(amx_ptr, params, 3, parse_cell_i64(value.as_deref()))
+}
+
+unsafe extern "C" fn cache_get_value_name_float(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
+    let row = amx::native_arg(params, 1).unwrap_or(0).max(0) as usize;
+    let field = read_string_arg(amx_ptr, params, 2).unwrap_or_default();
+    let active = ACTIVE_RESULT.load(Ordering::Relaxed);
+    let value = {
+        let results = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+        results.get(&active).and_then(|r| {
+            r.get_col_index(&field)
+                .and_then(|col| r.get_value(row, col))
+                .map(|s| s.to_string())
+        })
+    };
+    write_cell_ref(amx_ptr, params, 3, parse_cell_f32bits(value.as_deref()))
+}
+
+/// cache_get_value_index(row, field_idx, destination[], max_len)
+unsafe extern "C" fn cache_get_value_index(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
+    let row = amx::native_arg(params, 1).unwrap_or(0).max(0) as usize;
+    let col = amx::native_arg(params, 2).unwrap_or(0).max(0) as usize;
+    let active = ACTIVE_RESULT.load(Ordering::Relaxed);
+    let value = {
+        let results = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+        results
+            .get(&active)
+            .and_then(|r| r.get_value(row, col))
+            .map(|s| s.to_string())
+    };
+    match value {
+        Some(v) => write_string_dest(amx_ptr, params, 3, 4, &v),
+        None => 0,
+    }
+}
+
+unsafe extern "C" fn cache_get_value_index_int(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
+    let row = amx::native_arg(params, 1).unwrap_or(0).max(0) as usize;
+    let col = amx::native_arg(params, 2).unwrap_or(0).max(0) as usize;
+    let active = ACTIVE_RESULT.load(Ordering::Relaxed);
+    let value = {
+        let results = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+        results
+            .get(&active)
+            .and_then(|r| r.get_value(row, col))
+            .map(|s| s.to_string())
+    };
+    write_cell_ref(amx_ptr, params, 3, parse_cell_i64(value.as_deref()))
+}
+
+/// cache_insert_id() — PostgreSQL has no connection-wide last-insert id, so
+/// this reads the `id` column (or the first column) of row 0. INSERT queries
+/// must be written with `RETURNING id` for this to work.
+unsafe extern "C" fn cache_insert_id(_amx_ptr: *mut Amx, _params: *mut Cell) -> Cell {
+    let active = ACTIVE_RESULT.load(Ordering::Relaxed);
+    let results = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(r) = results.get(&active) else {
+        return 0;
+    };
+    if r.rows.is_empty() {
+        return 0;
+    }
+    let col = r.get_col_index("id").unwrap_or(0);
+    parse_cell_i64(r.get_value(0, col))
+}
+
+unsafe extern "C" fn cache_save(_amx_ptr: *mut Amx, _params: *mut Cell) -> Cell {
+    ACTIVE_RESULT.load(Ordering::Relaxed)
+}
+
+unsafe extern "C" fn cache_delete(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
+    let Some(result_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
+    handles::free_result(result_id) as Cell
+}
+
+unsafe extern "C" fn cache_affected_rows(_amx_ptr: *mut Amx, _params: *mut Cell) -> Cell {
+    let active = ACTIVE_RESULT.load(Ordering::Relaxed);
+    let results = RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+    results
+        .get(&active)
+        .map(|r| r.rows_affected.clamp(0, i32::MAX as u64) as Cell)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------

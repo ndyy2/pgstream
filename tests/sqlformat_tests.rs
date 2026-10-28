@@ -1,6 +1,6 @@
 //! Unit tests for the printf-Pawn style SQL formatter (pure, no DB).
 
-use pgstream::database::format::convert_pawn_format;
+use pgstream::database::format::{convert_pawn_format, scan_specifiers, FormatArgKind};
 use pgstream::database::parameters::SqlParam;
 
 fn i(v: i32) -> SqlParam {
@@ -137,4 +137,24 @@ fn trailing_percent_rejected() {
 fn unicode_outside_specifiers_survives() {
     let (sql, _) = convert_pawn_format("SELECT '🎉' WHERE id = %d", &[i(1)]).unwrap();
     assert_eq!(sql, "SELECT '🎉' WHERE id = $1");
+}
+
+#[test]
+fn mysql_compat_e_and_precision_specs() {
+    // %e (escaped string) binds as a plain string param.
+    let (sql, kinds) = scan_specifiers("INSERT INTO t (name, score) VALUES (%e, %d)").unwrap();
+    assert_eq!(sql, "INSERT INTO t (name, score) VALUES ($1, $2)");
+    assert_eq!(kinds, vec![FormatArgKind::Str, FormatArgKind::Int]);
+
+    // Precision flags like %.2f / %.4f are skipped, still bind float.
+    let (sql, kinds) = scan_specifiers("UPDATE t SET x = %.2f, y = %.4f WHERE id = %05d").unwrap();
+    assert_eq!(sql, "UPDATE t SET x = $1, y = $2 WHERE id = $3");
+    assert_eq!(
+        kinds,
+        vec![
+            FormatArgKind::Float,
+            FormatArgKind::Float,
+            FormatArgKind::Int
+        ]
+    );
 }

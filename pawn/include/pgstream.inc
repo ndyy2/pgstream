@@ -115,3 +115,24 @@ native bool:PG_IsNullByName(result, row, const col_name[]);
 // ---------------------------------------------------------------------------
 
 native PG_FreeResult(result);
+
+// ---------------------------------------------------------------------------
+// MySQL-compat layer (drop-in migration from pBlueG R41-4 gamemodes)
+// ---------------------------------------------------------------------------
+
+// pBlueG mysql_format clone: interpolates %d %i %s %f %e %x %X %c (plus
+// flags/precision like %.2f) directly into the SQL text.
+native PG_Format(connection, dest[], size = sizeof(dest), const fmt[], {Float, _}:...);
+
+// pBlueG mysql_tquery clone: async query, callback receives the extra args
+// described by format ("disf..."). Result readable via PG_ActiveResult()
+// during the callback; freed automatically afterwards.
+native PG_TQuery(connection, const query[], const callback[] = "", const format[] = "", {Float, _}:...);
+
+// pBlueG mysql_query clone: blocking query returning a persistent result
+// handle; free it with PG_FreeResult.
+native PG_SyncQuery(connection, const query[]);
+
+// Result id exposed as the "active cache" during a PG_TQuery callback
+// dispatch, or right after PG_SyncQuery. 0 when none.
+native PG_ActiveResult();

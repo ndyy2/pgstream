@@ -15,6 +15,15 @@ pub enum CompletionEvent {
         callback: String,
         extra: i32,
     },
+    /// mysql_tquery-style completion: the callback receives the extra args
+    /// listed in the invoke-time format string, not (connection, result, extra).
+    QueryFinishedExtras {
+        conn_id: i32,
+        result_id: i32,
+        callback: String,
+        query: String,
+        extras: Vec<ExtraArg>,
+    },
     CommandFinished {
         conn_id: i32,
         success: bool,
@@ -25,6 +34,13 @@ pub enum CompletionEvent {
         channel: String,
         payload: String,
     },
+}
+
+/// One extra callback argument; `Str` variants are pushed as AMX heap strings.
+#[derive(Clone)]
+pub enum ExtraArg {
+    Cell(i32),
+    Str(String),
 }
 
 struct QueueState {

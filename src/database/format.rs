@@ -81,11 +81,24 @@ pub fn scan_specifiers(input: &str) -> Result<(String, Vec<FormatArgKind>), Stri
                 }
             }
             '%' => {
-                let next = peek_ch(&mut iter);
+                // Skip optional flags/width/precision (e.g. `%.2f`, `%05d`)
+                // before the conversion letter — precision is irrelevant for
+                // bound parameters.
+                let mut next = peek_ch(&mut iter);
+                while let Some(c) = next {
+                    if c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | ' ' | '#' | '0' | '*') {
+                        iter.next();
+                        next = peek_ch(&mut iter);
+                    } else {
+                        break;
+                    }
+                }
                 let kind = match next {
                     Some('d') | Some('i') => Some(FormatArgKind::Int),
                     Some('f') => Some(FormatArgKind::Float),
-                    Some('s') => Some(FormatArgKind::Str),
+                    // MySQL-plugin style escaped string; binding makes it
+                    // safe already, so it maps to a plain string parameter.
+                    Some('s') | Some('e') | Some('q') => Some(FormatArgKind::Str),
                     Some('c') => Some(FormatArgKind::Char),
                     Some('x') => Some(FormatArgKind::Hex),
                     Some('X') => Some(FormatArgKind::HexUpper),

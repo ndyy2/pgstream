@@ -1,5 +1,16 @@
 # CHANGELOG — PGStream
 
+## [0.3.3] — 2026-10-28
+
+### Ditambahkan
+
+- **`QueryFinishedExtras` completion + `dispatch_callback_mixed`** — event completion untuk `PG_AsyncQuery`/`PG_QueryFormat` dengan argumen ekstra di luar (conn, result, extra); `dispatch_callback_mixed` push argumen string sebagai AMX heap string (dikumpulkan & dirilis setelah exec) serta argumen cell sebagai plain cell.
+- Parser format: flags/width/precision sebelum konversi (`%.2f`, `%05d`) di-skip (precision tidak relevan untuk bound param); specifier `%e`/`%q` dianggap string (MySQL-plugin style escaped string).
+
+### Perbaikan
+
+- `cargo fmt --all` bersih (formatting terakhir).
+
 ## [0.3.2] — 2026-10-28
 
 ### Ditambahkan
