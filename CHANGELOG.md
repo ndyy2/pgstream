@@ -1,5 +1,29 @@
 # CHANGELOG — PGStream
 
+## [0.2.1] — 2026-10-28 (patch hardening)
+
+Patch penguatan di atas 0.2.0. `PGSTREAM_VERSION` tetap `200` (konstanta native ke klien Pawn); `Cargo.toml` kini `0.2.1` (sinkron dengan tag rilis; `PG_Connect`/`VERSION_TEXT` tetap menampilkan "0.2.x").
+
+### Ditambahkan
+
+- **TLS pada jalur `PG_Connect` (key-value)** — jalur ini sebelumnya tanpa TLS sama sekali. String koneksi kini selalu menyertakan `sslmode` dari config (`database.sslmode`, default `require`) — `src/plugin.rs::pg_connect`.
+- **Config baru `database.sslmode`** (`src/config.rs`) — default `require`; nilai didukung: `disable`, `prefer`, `require`, `verify-ca`, `verify-full`. `pgstream.toml` lama tanpa key ini tetap kompatibel (fallback `require`; teruji di `tests/connect_config_tests.rs::toml_without_sslmode_falls_back_to_require`).
+- **CI** — `.github/workflows/ci.yml`: fmt check, clippy, `cargo test` (host), cross-build `pgstream.dll` (PE32 x86, `i686-pc-windows-gnu`), upload artifact.
+- **Release otomatis** — `.github/workflows/release.yml`: push tag `v*` → GitHub release berisi `pgstream.dll` + `pawn/include/pgstream.inc`; release notes diambil dari section teratas `CHANGELOG.md`.
+- **E2E harness** — `scripts/test-e2e.sh <server-dir> [timeout-detik]`: build DLL, salin ke server SA:MP (wine), kompilasi `pawn/tests/pgstream_test.pwn` via `pawncc.exe` (wine), jalankan server, asersi log. URL database dari env `PGSTREAM_TEST_URL` (sekret tidak masuk repo); skip (exit 0) jika env kosong.
+- **8 test baru** — `tests/connect_config_tests.rs`: resolusi sslmode bentuk key-value & URL, fallback saat `sslmode` kosong/tidak ada, nilai unknown fail-closed, default config, TOML lama tanpa `sslmode`, penolakan saat batas koneksi tercapai, regression `sslmode` ganda (last-wins + rewrite semua kemunculan).
+
+### Diperbaiki
+
+- **`sslmode` ganda tidak lagi memecah keputusan TLS** — `resolve_ssl_mode` (`src/config.rs`) kini memakai kemunculan **terakhir** (aturan yang sama dengan `tokio_postgres::Config::from_str`) dan menulis ulang **semua** kemunculan. Sebelumnya kemunculan pertama dibaca plugin sedangkan tokio-postgres membaca yang terakhir: URL `?sslmode=verify-full&sslmode=disable` membuat plugin memilih connector terverifikasi, sementara wire berjalan plaintext. Regression test: `tests/connect_config_tests.rs::duplicate_sslmode_last_wins_and_all_occurrences_rewritten`.
+- **`cargo fmt --check` bersih** — formatting source + test diseragamkan (CI sebelumnya merah karena fmt check).
+
+### Perilaku berubah
+
+- **`query_timeout_seconds` & `connect_timeout_seconds` kini benar-benar diterapkan** — sebelumnya hanya didefinisikan. Query dibungkus `tokio::time::timeout` (`src/plugin.rs::execute_query_internal`, error `Query timed out after Ns`); koneksi pakai `Config::connect_timeout` (`spawn_connect`).
+- **`pool.max_size` kini batas koneksi aktif** — `try_register_connection` menghitung handle berstatus `Connecting`/`Connected`; bila ≥ `max_size`, koneksi ditolak dengan error `Max connections reached (N)` (handle tetap disimpan berstatus `Failed` agar `PG_GetError` melaporkan alasannya). Sebelumnya angka ini tidak pernah menjadi batas apa pun.
+- **Mode terenkripsi-tanpa-verifikasi (`require`/`prefer`) memunculkan warning** — satu kali per koneksi: `[PGStream] WARN: TLS tanpa verifikasi sertifikat (sslmode=...)`. Verifikasi penuh (`verify-ca`/`verify-full`) memakai connector `make_tls_connector_verified` (root store `webpki-roots` + hostname check).
+
 ## [0.2.0] — 2026
 
 Menurut `pawn/include/pgstream.inc` (PGSTREAM_VERSION = 200), `src/plugin.rs` (VERSION_TEXT "PGStream 0.2.0"), dan riwayat `src/`.

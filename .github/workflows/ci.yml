@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable) + mingw targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-pc-windows-gnu
+          components: rustfmt, clippy
+
+      - name: Install MinGW cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-i686 g++-mingw-w64-i686
+
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ./target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy (-D warnings)
+        continue-on-error: true
+        run: cargo clippy --target x86_64-unknown-linux-gnu -- -D warnings
+
+      - name: Run unit tests on host
+        run: cargo test --target x86_64-unknown-linux-gnu
+
+      - name: Cross-build Windows DLL (PE32 x86)
+        run: cargo build --target i686-pc-windows-gnu --release
+
+      - name: Verify DLL exists
+        run: test -f target/i686-pc-windows-gnu/release/pgstream.dll
+
+      - name: Upload pgstream.dll artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgstream.dll
+          path: target/i686-pc-windows-gnu/release/pgstream.dll
+          if-no-files-found: error

@@ -1,6 +1,6 @@
 # PGStream
 
-Plugin PostgreSQL native untuk SA:MP, ditulis dalam Rust. **Versi 0.2.0** (v0.1.0 awal, M0).
+Plugin PostgreSQL native untuk SA:MP, ditulis dalam Rust. **Versi 0.2.1** (patch hardening di atas 0.2.0; v0.1.0 awal, M0).
 
 - Target: Windows x86 32-bit (`cdylib`), output `pgstream.dll` (PE32).
 - Koneksi via `tokio-postgres` + `rustls` — tanpa dependensi libpq.
@@ -18,19 +18,20 @@ Plugin PostgreSQL native untuk SA:MP, ditulis dalam Rust. **Versi 0.2.0** (v0.1.
 7. [Catatan ABI varargs (pawncc 3.2.3664)](#catatan-abi-varargs-pawncc-323664)
 8. [Arsitektur](#arsitektur)
 9. [Testing](#testing)
-10. [Batasan yang diketahui](#batasan-yang-diketahui)
-11. [Verified against](#verified-against)
+10. [CI & Release](#ci--release)
+11. [Batasan yang diketahui](#batasan-yang-diketahui)
+12. [Verified against](#verified-against)
 
 ## Fitur
 
 - **Zero-dependency**: tidak butuh libpq; protokol PostgreSQL murni Rust (`tokio-postgres`, `rustls`).
 - **Asynchronous**: query jalan di tokio runtime background; game loop tidak pernah blocking.
-- **TLS/SSL**: `sslmode` di URL connect string — `require`, `verify-ca`, `verify-full`. Benar-benar teruji dari `pawn/tests/pgstream_test.pwn` ke Neon managed Postgres. Lalu perhatikan [Batasan](#batasan-yang-diketahui) untuk trade-off security `sslmode=require`.
+- **TLS/SSL** di kedua jalur koneksi: `PG_ConnectUrl` (parameter `sslmode=` di URL) dan `PG_Connect` (field `sslmode` di `pgstream.toml`, default `require`). Mode: `disable`, `prefer`, `require`, `verify-ca`, `verify-full`. Teruji dari `pawn/tests/pgstream_test.pwn` ke Neon managed Postgres. Lihat [TLS / sslmode](#tls--sslmode) — produksi wajib `verify-full`.
 - **Transaksi**: `PG_Begin` / `PG_Commit` / `PG_Rollback`.
 - **LISTEN/NOTIFY**: pub/sub antipoll — `PG_Listen` / `PG_Notify`, callback global `OnPGNotify`.
 - **Prepared statements**: `PG_Prepare` / `PG_ExecutePrepared`.
 - **Parameterized queries**: placeholder `$1, $2, ...` + format string `'is f b'` (tal, float, string, bool, null) via varargs.
-- **Connection pool** internal (di konfigurasi `pool.max_size`).
+- **Batas koneksi aktif** — `pool.max_size` membatasi jumlah koneksi hidup (`Connecting`/`Connected`), bukan pool idle; koneksi di atas batas ditolak dengan error `Max connections reached (N)`.
 - **Result API** dua arah: index kolom dan nama kolom.
 
 ## Native API
@@ -40,8 +41,8 @@ Ringkasan; spesifikasi lengkap per native lihat [docs/API.md](docs/API.md).
 | Native | Fungsi |
 |---|---|
 | `PG_Version(dest[], size)` | Kode & teks versi plugin |
-| `PG_Connect(host,user,pass,db,port,cb)` | Koneksi tanpa TLS |
-| `PG_ConnectUrl(url,cb)` | Koneksi via URL; TLS otomatis jika `sslmode=` ada |
+| `PG_Connect(host,user,pass,db,port,cb)` | Koneksi key-value; TLS sesuai `sslmode` di `pgstream.toml` (default `require`) |
+| `PG_ConnectUrl(url,cb)` | Koneksi via URL; TLS sesuai `sslmode=` di URL (fallback: config) |
 | `PG_Close(conn)` | Tutup koneksi |
 | `PG_IsConnected(conn)` | Status hidup koneksi |
 | `PG_GetError(conn,dest,size)` | Pesan error terakhir |
@@ -88,7 +89,8 @@ cargo build --target i686-pc-windows-gnu --release
    port = 5432
    database = "novalife_db"
    username = "postgres"
-   password = ""
+   password_env = "PGSTREAM_DB_PASSWORD"
+   sslmode = "verify-full"
    connect_timeout_seconds = 5
    query_timeout_seconds = 10
 
@@ -99,7 +101,7 @@ cargo build --target i686-pc-windows-gnu --release
    level = "debug"
    ```
 
-   Field lengkap lihat bagian [Konfigurasi](#konfigurasi-pgstreamtoml).
+   Field lengkap lihat bagian [Konfigurasi](#konfigurasi-pgstreamtoml). Contoh memakai `password_env` (password dari env var, bukan plaintext di file) dan `sslmode = "verify-full"` (wajib produksi); `pool.max_size` = batas koneksi aktif, bukan pool idle.
 4. Restart server. Plugin load saat `Load()` SA:MP SDK; versi tercetak lewat `logprintf`.
 
 ## Konfigurasi pgstream.toml
@@ -110,20 +112,37 @@ Struct sumber `src/config.rs`. Semua section punya default; field wajib dalam pr
 
 | Field | Tipe | Default | Keterangan |
 |---|---|---|---|
-| `host` | u16/string — | — | Host database |
+| `host` | string | `127.0.0.1` | Host database |
 | `port` | u16 | 5432 | Port PostgreSQL |
 | `database` | string | `samp_db` | Nama database |
 | `username` | string | `postgres` | User database |
 | `password` | string | `""` | Password |
 | `password_env` | string (ops.) | — | Nama env var; jika ada dan env var terbaca, menimpa `password` |
-| `connect_timeout_seconds` | u64 | 5 | Timeout koneksi |
-| `query_timeout_seconds` | u64 | 15 | Timeout query |
+| `sslmode` | string | `require` | Mode TLS; lihat [TLS / sslmode](#tls--sslmode) |
+| `connect_timeout_seconds` | u64 | 5 | Batas durasi koneksi (diterapkan) |
+| `query_timeout_seconds` | u64 | 15 | Batas durasi query (diterapkan); melebihi → error `Query timed out after Ns` |
 
 `[pool]`:
 
 | Field | Default | Keterangan |
 |---|---|---|
-| `max_size` | 5 | Max koneksi pool |
+| `max_size` | 5 | Batas jumlah koneksi aktif (`Connecting`/`Connected`), bukan pool idle; koneksi di atas batas ditolak dengan error `Max connections reached (N)` |
+
+### TLS / sslmode
+
+Perilaku TLS per mode (berlaku di kedua jalur koneksi — `PG_Connect` via field `sslmode` di `pgstream.toml`, `PG_ConnectUrl` via parameter URL):
+
+| Mode | TLS | Verifikasi sertifikat | Catatan |
+|---|---|---|---|
+| `disable` | tidak | — | Koneksi plaintext. Hanya untuk lokal/LAN tepercaya. |
+| `prefer` | ya | tidak | Terenkripsi, **tanpa** verifikasi. Sama dengan `require` di PGStream. |
+| `require` | ya | tidak | Terenkripsi **tanpa** verifikasi sertifikat. **Rawan MITM.** Default kalau config tidak punya key. |
+| `verify-ca` | ya | ya (webpki-roots + hostname) | |
+| `verify-full` | ya | ya (webpki-roots + hostname) | **Wajib untuk produksi.** |
+
+> **Peringatan**: `require`/`prefer` mengenkripsi traffic tapi **tidak memverifikasi identitas server yang kamu hubungkan** — penyerang di jalur (MITM) bisa menyajikan sertifikat apa pun. By-design (`setara require` di libpq), tapi **produksi wajib `sslmode=verify-full`**. Saat mode terenkripsi-tanpa-verifikasi aktif, plugin mencetak warning sekali per koneksi: `[PGStream] WARN: TLS tanpa verifikasi sertifikat (sslmode=...)`.
+
+Catatan implementasi: `verify-ca` dan `verify-full` memakai connector terverifikasi yang sama (root store `webpki-roots`, cek hostname; TLS 1.2/1.3). Code tidak membedakan keduanya. Nilai `sslmode` yang tidak dikenal dibiarkan (koneksi ditolak / fail-closed). `sslmode` kosong atau tidak ada → fallback ke `database.sslmode` (default `require`).
 
 `[logging]`:
 
@@ -178,14 +197,19 @@ Tiap koneksi (management oleh `handles.rs`: `CONNECTIONS`, `RESULTS`) menjalanka
 
 - Unit/integration Rust: `cargo test`.
 - Live test end-to-end: `pawn/tests/pgstream_test.pwn` — mencakup TLS connect, SELECT/INSERT, transaksi, prepared statement, LISTEN/NOTIFY, escape string. Jalankan sebagai gamemode di server SA:MP dengan `pgstream.toml` mengarah ke database test.
+- E2E harness: `scripts/test-e2e.sh <server-dir> [timeout-detik]` — build `pgstream.dll`, salin ke `server-dir/plugins/pgstream.dll`, kompilasi `pawn/tests/pgstream_test.pwn` → `.amx` via wine `pawncc.exe` (`pawno/include` + `pawn/include`), jalankan `samp-server.exe` (wine) dan asersi log (`PASS: ...`, tanpa `FAIL`). URL database test dari env **`PGSTREAM_TEST_URL`** (sekret tidak disimpan di repo; disuntikkan ke salinan `.pwn` via `sed`). Jika `PGSTREAM_TEST_URL` kosong/tidak di-set → print `SKIP` & exit 0.
+
+## CI & Release
+
+- **CI** (`.github/workflows/ci.yml`, jalan di setiap push/PR): `cargo fmt --check`, clippy, `cargo test` (host), cross-build `pgstream.dll` (`i686-pc-windows-gnu`, PE32 x86), upload artifact.
+- **Release otomatis** (`.github/workflows/release.yml`): push tag `v*` → GitHub release berisi `pgstream.dll` + `pawn/include/pgstream.inc`; release notes diambil dari section teratas `CHANGELOG.md`. Tag ulang release yang sama meng-overwrite file (`--clobber`).
 
 ## Batasan yang diketahui
 
 - Tipe kolom belum didukung: `NUMERIC`, `UUID`, `JSON`/`JSONB`, `BYTEA`. Baca via `PG_GetString` tidak dijamin.
-- **sslmode=require tidak memverifikasi sertifikat server** (encrypted tapi unauthenticated — perilaku setara `require` di libpq/nginx pg). Ini by-design trade-off; untuk produksi pakai `sslmode=verify-full` (atau verifikasi `verify-ca`).
+- **`sslmode=require`/`prefer` tidak memverifikasi sertifikat server** (encrypted tapi unauthenticated — setara `require` di libpq). Berlaku untuk kedua jalur koneksi (`PG_Connect` via config, `PG_ConnectUrl` via URL). By design; **produksi wajib `sslmode=verify-full`** (lihat [TLS / sslmode](#tls--sslmode)).
 - Format varargs terikat ke **pawncc 3.2.3664**. Compiler Pawn lain tak kompatibel.
 - `PG_EscapeString` pada koneksi yang belum connect (`conn=0`) didokumentasi di test bergantung pada koneksi pertama; holder harus punya koneksi valid.
-- Versi di `Cargo.toml` masih `0.1.0` — plugin ekspos 0.2.0 (`VERSION_TEXT`, `PGSTREAM_VERSION`), Cargo version belum di-sync.
 
 ## Verified against
 

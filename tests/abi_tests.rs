@@ -30,8 +30,18 @@ fn test_native_arg_bounds() {
 fn test_query_result_named_columns_and_nulls() {
     let cols = vec!["id".into(), "Username".into(), "Score".into(), "Bio".into()];
     let rows = vec![
-        vec![Some("1".into()), Some("Axelon".into()), Some("100".into()), None],
-        vec![Some("2".into()), Some("Player2".into()), None, Some("Hello".into())],
+        vec![
+            Some("1".into()),
+            Some("Axelon".into()),
+            Some("100".into()),
+            None,
+        ],
+        vec![
+            Some("2".into()),
+            Some("Player2".into()),
+            None,
+            Some("Hello".into()),
+        ],
     ];
     let res = QueryResult::new(cols, rows, 2);
 

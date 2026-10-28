@@ -87,8 +87,7 @@ pub type AmxPushStringFn =
 pub type AmxReleaseFn = unsafe extern "C" fn(*mut Amx, Cell) -> c_int;
 pub type AmxSetStringFn =
     unsafe extern "C" fn(*mut Cell, *const c_char, c_int, c_int, usize) -> c_int;
-pub type AmxGetStringFn =
-    unsafe extern "C" fn(*mut c_char, *const Cell, c_int, usize) -> c_int;
+pub type AmxGetStringFn = unsafe extern "C" fn(*mut c_char, *const Cell, c_int, usize) -> c_int;
 pub type AmxStrLenFn = unsafe extern "C" fn(*const Cell, *mut c_int) -> c_int;
 
 /// Native function receives `params[0] = argcount` (cell-indexed: `*params`).

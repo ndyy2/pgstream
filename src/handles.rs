@@ -1,7 +1,7 @@
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Mutex;
-use once_cell::sync::Lazy;
 
 use crate::database::connection::PgConnection;
 use crate::database::result::QueryResult;

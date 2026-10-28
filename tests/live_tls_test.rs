@@ -44,10 +44,13 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 async fn test_notls_connect() {
     // Test 1: Try NoTls
     // Set PGSTREAM_TEST_URL=host=... user=... password=... dbname=... to run this test.
-    let url = std::env::var("PGSTREAM_TEST_URL").unwrap_or_else(|_| "host=invalid.invalid dbname=skip_test".into());
-    match tokio_postgres::connect(url, tokio_postgres::NoTls).await {
+    let url = std::env::var("PGSTREAM_TEST_URL")
+        .unwrap_or_else(|_| "host=invalid.invalid dbname=skip_test".into());
+    match tokio_postgres::connect(&url, tokio_postgres::NoTls).await {
         Ok((client, connection)) => {
-            tokio::spawn(async move { let _ = connection.await; });
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
             let row = client.query_one("SELECT 1+1 AS result", &[]).await.unwrap();
             let val: i32 = row.get(0);
             println!("NoTls SUCCESS: 1+1 = {}", val);
@@ -72,18 +75,25 @@ async fn test_tls_connect_keyvalue() {
     let connector = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
     let cfg = format!(
         "{} sslmode=require",
-        std::env::var("PGSTREAM_TEST_URL").unwrap_or_else(|_| "host=invalid.invalid dbname=skip_test".into())
+        std::env::var("PGSTREAM_TEST_URL")
+            .unwrap_or_else(|_| "host=invalid.invalid dbname=skip_test".into())
     );
 
-    match tokio_postgres::connect(cfg, connector).await {
+    match tokio_postgres::connect(&cfg, connector).await {
         Ok((client, connection)) => {
-            tokio::spawn(async move { let _ = connection.await; });
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
             let row = client.query_one("SELECT 1+1 AS result", &[]).await.unwrap();
             let val: i32 = row.get(0);
             println!("TLS key=value SUCCESS: 1+1 = {}", val);
         }
         Err(e) => {
-            println!("TLS key=value FAILED: {} (source: {:?})", e, std::error::Error::source(&e));
+            println!(
+                "TLS key=value FAILED: {} (source: {:?})",
+                e,
+                std::error::Error::source(&e)
+            );
         }
     }
 }

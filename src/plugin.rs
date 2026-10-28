@@ -2,13 +2,14 @@
 
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::abi::amx::{self, Amx, Cell};
 use crate::abi::callbacks;
-use crate::config::Config;
+use crate::config;
 use crate::database::connection::{ConnectionStatus, PgConnection};
 use crate::database::parameters::SqlParam;
 use crate::database::result::QueryResult;
@@ -23,7 +24,9 @@ pub(crate) unsafe fn table_fn<T: Copy>(idx: usize) -> Option<T> {
     if table.is_null() {
         return None;
     }
-    Some(ptr::read((table as *const *const c_void).add(idx) as *const T))
+    Some(ptr::read(
+        (table as *const *const c_void).add(idx) as *const T
+    ))
 }
 
 pub fn logprintf(msg: &str) {
@@ -42,17 +45,21 @@ pub fn logprintf(msg: &str) {
 }
 
 pub const VERSION_CODE: Cell = 200;
-const VERSION_TEXT: &str = "PGStream 0.2.0";
+const VERSION_TEXT: &str = "PGStream 0.2.1";
 
 // ---------------------------------------------------------------------------
 // TLS
 // ---------------------------------------------------------------------------
 
 /// TLS connector with full certificate validation (sslmode=verify-full).
+/// Uses ring provider, TLS1.2/TLS1.3, and webpki roots for hostname check.
 fn make_tls_connector_verified() -> tokio_postgres_rustls::MakeRustlsConnect {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let tls_config = rustls::ClientConfig::builder()
+    let provider = rustls::crypto::ring::default_provider();
+    let tls_config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
+        .unwrap()
         .with_root_certificates(root_store)
         .with_no_client_auth();
     tokio_postgres_rustls::MakeRustlsConnect::new(tls_config)
@@ -128,9 +135,9 @@ pub unsafe extern "system" fn Load(pp_data: *mut *mut c_void) -> bool {
 
     runtime::init_runtime();
 
-    let cfg = Config::load_from_file("pgstream.toml");
+    let cfg = config::Config::global();
     logprintf(&format!(
-        "[PGStream] v0.2.0 initialized (Pool size: {}, Host: {})",
+        "[PGStream] v0.2.0 initialized (Max connections: {}, Host: {})",
         cfg.pool.max_size, cfg.database.host
     ));
 
@@ -352,9 +359,9 @@ fn column_value(row: &tokio_postgres::Row, idx: usize) -> Option<String> {
     }
 }
 
-async fn execute_query_internal(
+async fn execute_query_internal<T: tokio_postgres::ToStatement + Sync + ?Sized>(
     client: &tokio_postgres::Client,
-    query: &str,
+    query: &T,
     sql_params: &[SqlParam],
 ) -> QueryResult {
     let params_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = sql_params
@@ -362,32 +369,40 @@ async fn execute_query_internal(
         .map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync))
         .collect();
 
-    match client.query(query, &params_refs[..]).await {
-        Ok(rows) => {
-            let mut cols = Vec::new();
-            if let Some(first) = rows.first() {
-                for col in first.columns() {
-                    cols.push(col.name().to_string());
+    let timeout = config::query_timeout();
+    let run = async {
+        match client.query(query, &params_refs[..]).await {
+            Ok(rows) => {
+                let mut cols = Vec::new();
+                if let Some(first) = rows.first() {
+                    for col in first.columns() {
+                        cols.push(col.name().to_string());
+                    }
+                }
+                let mut data_rows = Vec::new();
+                for row in rows.iter() {
+                    let mut r = Vec::new();
+                    for (i, _) in row.columns().iter().enumerate() {
+                        r.push(column_value(row, i));
+                    }
+                    data_rows.push(r);
+                }
+                let len = data_rows.len() as u64;
+                QueryResult::new(cols, data_rows, len)
+            }
+            Err(e) => {
+                if let Ok(affected) = client.execute(query, &params_refs[..]).await {
+                    QueryResult::empty_success(affected)
+                } else {
+                    QueryResult::error(e.to_string())
                 }
             }
-            let mut data_rows = Vec::new();
-            for row in rows.iter() {
-                let mut r = Vec::new();
-                for (i, _) in row.columns().iter().enumerate() {
-                    r.push(column_value(row, i));
-                }
-                data_rows.push(r);
-            }
-            let len = data_rows.len() as u64;
-            QueryResult::new(cols, data_rows, len)
         }
-        Err(e) => {
-            if let Ok(affected) = client.execute(query, &params_refs[..]).await {
-                QueryResult::empty_success(affected)
-            } else {
-                QueryResult::error(e.to_string())
-            }
-        }
+    };
+
+    match tokio::time::timeout(timeout, run).await {
+        Ok(res) => res,
+        Err(_) => QueryResult::error(format!("Query timed out after {}s", timeout.as_secs())),
     }
 }
 
@@ -412,38 +427,125 @@ fn escape_identifier(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 static PG_NATIVES: [amx::NativeInfo; 29] = [
-    amx::NativeInfo { name: b"PG_Version\0".as_ptr() as *const c_char, func: Some(pg_version) },
-    amx::NativeInfo { name: b"PG_Connect\0".as_ptr() as *const c_char, func: Some(pg_connect) },
-    amx::NativeInfo { name: b"PG_ConnectUrl\0".as_ptr() as *const c_char, func: Some(pg_connect_url) },
-    amx::NativeInfo { name: b"PG_Close\0".as_ptr() as *const c_char, func: Some(pg_close) },
-    amx::NativeInfo { name: b"PG_IsConnected\0".as_ptr() as *const c_char, func: Some(pg_is_connected) },
-    amx::NativeInfo { name: b"PG_AsyncQuery\0".as_ptr() as *const c_char, func: Some(pg_async_query) },
-    amx::NativeInfo { name: b"PG_NumRows\0".as_ptr() as *const c_char, func: Some(pg_num_rows) },
-    amx::NativeInfo { name: b"PG_NumFields\0".as_ptr() as *const c_char, func: Some(pg_num_fields) },
-    amx::NativeInfo { name: b"PG_GetAffectedRows\0".as_ptr() as *const c_char, func: Some(pg_get_affected_rows) },
-    amx::NativeInfo { name: b"PG_GetString\0".as_ptr() as *const c_char, func: Some(pg_get_string) },
-    amx::NativeInfo { name: b"PG_GetInt\0".as_ptr() as *const c_char, func: Some(pg_get_int) },
-    amx::NativeInfo { name: b"PG_GetFloat\0".as_ptr() as *const c_char, func: Some(pg_get_float) },
-    amx::NativeInfo { name: b"PG_IsNull\0".as_ptr() as *const c_char, func: Some(pg_is_null) },
-    amx::NativeInfo { name: b"PG_FieldName\0".as_ptr() as *const c_char, func: Some(pg_field_name) },
-    amx::NativeInfo { name: b"PG_GetStringByName\0".as_ptr() as *const c_char, func: Some(pg_get_string_by_name) },
-    amx::NativeInfo { name: b"PG_GetIntByName\0".as_ptr() as *const c_char, func: Some(pg_get_int_by_name) },
-    amx::NativeInfo { name: b"PG_GetFloatByName\0".as_ptr() as *const c_char, func: Some(pg_get_float_by_name) },
-    amx::NativeInfo { name: b"PG_IsNullByName\0".as_ptr() as *const c_char, func: Some(pg_is_null_by_name) },
-    amx::NativeInfo { name: b"PG_FreeResult\0".as_ptr() as *const c_char, func: Some(pg_free_result) },
-    amx::NativeInfo { name: b"PG_GetError\0".as_ptr() as *const c_char, func: Some(pg_get_error) },
-    amx::NativeInfo { name: b"PG_EscapeString\0".as_ptr() as *const c_char, func: Some(pg_escape_string) },
+    amx::NativeInfo {
+        name: b"PG_Version\0".as_ptr() as *const c_char,
+        func: Some(pg_version),
+    },
+    amx::NativeInfo {
+        name: b"PG_Connect\0".as_ptr() as *const c_char,
+        func: Some(pg_connect),
+    },
+    amx::NativeInfo {
+        name: b"PG_ConnectUrl\0".as_ptr() as *const c_char,
+        func: Some(pg_connect_url),
+    },
+    amx::NativeInfo {
+        name: b"PG_Close\0".as_ptr() as *const c_char,
+        func: Some(pg_close),
+    },
+    amx::NativeInfo {
+        name: b"PG_IsConnected\0".as_ptr() as *const c_char,
+        func: Some(pg_is_connected),
+    },
+    amx::NativeInfo {
+        name: b"PG_AsyncQuery\0".as_ptr() as *const c_char,
+        func: Some(pg_async_query),
+    },
+    amx::NativeInfo {
+        name: b"PG_NumRows\0".as_ptr() as *const c_char,
+        func: Some(pg_num_rows),
+    },
+    amx::NativeInfo {
+        name: b"PG_NumFields\0".as_ptr() as *const c_char,
+        func: Some(pg_num_fields),
+    },
+    amx::NativeInfo {
+        name: b"PG_GetAffectedRows\0".as_ptr() as *const c_char,
+        func: Some(pg_get_affected_rows),
+    },
+    amx::NativeInfo {
+        name: b"PG_GetString\0".as_ptr() as *const c_char,
+        func: Some(pg_get_string),
+    },
+    amx::NativeInfo {
+        name: b"PG_GetInt\0".as_ptr() as *const c_char,
+        func: Some(pg_get_int),
+    },
+    amx::NativeInfo {
+        name: b"PG_GetFloat\0".as_ptr() as *const c_char,
+        func: Some(pg_get_float),
+    },
+    amx::NativeInfo {
+        name: b"PG_IsNull\0".as_ptr() as *const c_char,
+        func: Some(pg_is_null),
+    },
+    amx::NativeInfo {
+        name: b"PG_FieldName\0".as_ptr() as *const c_char,
+        func: Some(pg_field_name),
+    },
+    amx::NativeInfo {
+        name: b"PG_GetStringByName\0".as_ptr() as *const c_char,
+        func: Some(pg_get_string_by_name),
+    },
+    amx::NativeInfo {
+        name: b"PG_GetIntByName\0".as_ptr() as *const c_char,
+        func: Some(pg_get_int_by_name),
+    },
+    amx::NativeInfo {
+        name: b"PG_GetFloatByName\0".as_ptr() as *const c_char,
+        func: Some(pg_get_float_by_name),
+    },
+    amx::NativeInfo {
+        name: b"PG_IsNullByName\0".as_ptr() as *const c_char,
+        func: Some(pg_is_null_by_name),
+    },
+    amx::NativeInfo {
+        name: b"PG_FreeResult\0".as_ptr() as *const c_char,
+        func: Some(pg_free_result),
+    },
+    amx::NativeInfo {
+        name: b"PG_GetError\0".as_ptr() as *const c_char,
+        func: Some(pg_get_error),
+    },
+    amx::NativeInfo {
+        name: b"PG_EscapeString\0".as_ptr() as *const c_char,
+        func: Some(pg_escape_string),
+    },
     // Transactions
-    amx::NativeInfo { name: b"PG_Begin\0".as_ptr() as *const c_char, func: Some(pg_begin) },
-    amx::NativeInfo { name: b"PG_Commit\0".as_ptr() as *const c_char, func: Some(pg_commit) },
-    amx::NativeInfo { name: b"PG_Rollback\0".as_ptr() as *const c_char, func: Some(pg_rollback) },
+    amx::NativeInfo {
+        name: b"PG_Begin\0".as_ptr() as *const c_char,
+        func: Some(pg_begin),
+    },
+    amx::NativeInfo {
+        name: b"PG_Commit\0".as_ptr() as *const c_char,
+        func: Some(pg_commit),
+    },
+    amx::NativeInfo {
+        name: b"PG_Rollback\0".as_ptr() as *const c_char,
+        func: Some(pg_rollback),
+    },
     // Listen / Notify
-    amx::NativeInfo { name: b"PG_Listen\0".as_ptr() as *const c_char, func: Some(pg_listen) },
-    amx::NativeInfo { name: b"PG_Notify\0".as_ptr() as *const c_char, func: Some(pg_notify) },
+    amx::NativeInfo {
+        name: b"PG_Listen\0".as_ptr() as *const c_char,
+        func: Some(pg_listen),
+    },
+    amx::NativeInfo {
+        name: b"PG_Notify\0".as_ptr() as *const c_char,
+        func: Some(pg_notify),
+    },
     // Prepared Statements
-    amx::NativeInfo { name: b"PG_Prepare\0".as_ptr() as *const c_char, func: Some(pg_prepare) },
-    amx::NativeInfo { name: b"PG_ExecutePrepared\0".as_ptr() as *const c_char, func: Some(pg_execute_prepared) },
-    amx::NativeInfo { name: ptr::null(), func: None },
+    amx::NativeInfo {
+        name: b"PG_Prepare\0".as_ptr() as *const c_char,
+        func: Some(pg_prepare),
+    },
+    amx::NativeInfo {
+        name: b"PG_ExecutePrepared\0".as_ptr() as *const c_char,
+        func: Some(pg_execute_prepared),
+    },
+    amx::NativeInfo {
+        name: ptr::null(),
+        func: None,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -452,7 +554,53 @@ static PG_NATIVES: [amx::NativeInfo; 29] = [
 
 unsafe extern "C" fn pg_version(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
     let res = write_string_dest(amx_ptr, params, 1, 2, VERSION_TEXT);
-    if res != 1 { res } else { VERSION_CODE }
+    if res != 1 {
+        res
+    } else {
+        VERSION_CODE
+    }
+}
+
+/// Registers a connection handle, enforcing the configured max active connections.
+/// On rejection a `Failed` handle is stored so `PG_GetError` still reports the reason.
+pub fn try_register_connection(conn_id: i32, max_size: usize) -> Result<(), String> {
+    let mut conns = CONNECTIONS.lock().unwrap();
+    let active = conns
+        .values()
+        .filter(|c| {
+            matches!(
+                c.status,
+                ConnectionStatus::Connecting | ConnectionStatus::Connected
+            )
+        })
+        .count();
+    if active >= max_size {
+        let msg = format!("Max connections reached ({})", max_size);
+        let mut c = PgConnection::new(conn_id);
+        c.status = ConnectionStatus::Failed;
+        c.last_error = Some(msg.clone());
+        conns.insert(conn_id, c);
+        return Err(msg);
+    }
+    conns.insert(conn_id, PgConnection::new(conn_id));
+    Ok(())
+}
+
+/// Marks a connection as failed (so `PG_GetError` works) and fires the callback with success=0.
+fn fail_connect(conn_id: i32, callback: &str, msg: &str) {
+    logprintf(&format!("[PGStream] Connect failed: {}", msg));
+    {
+        let mut conns = CONNECTIONS.lock().unwrap();
+        if let Some(c) = conns.get_mut(&conn_id) {
+            c.status = ConnectionStatus::Failed;
+            c.last_error = Some(msg.to_string());
+        }
+    }
+    runtime::send_completion(CompletionEvent::Connected {
+        conn_id,
+        success: false,
+        callback: callback.to_string(),
+    });
 }
 
 /// native PG_Connect(const host[], const user[], const password[], const database[], port = 5432, const callback[] = "");
@@ -464,9 +612,15 @@ unsafe extern "C" fn pg_connect(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
     let port = amx::native_arg(params, 5).unwrap_or(5432) as u16;
     let callback = read_string_arg(amx_ptr, params, 6).unwrap_or_default();
 
+    let sslmode = config::Config::global().database.sslmode;
     let config = format!(
-        "host={} port={} user={} password={} dbname={}",
-        host, port, user, pass, db
+        "host={} port={} user={} password={} dbname={} sslmode={}",
+        host,
+        port,
+        user,
+        pass,
+        db,
+        sslmode.trim().to_ascii_lowercase()
     );
     spawn_connect(config, callback)
 }
@@ -479,23 +633,47 @@ unsafe extern "C" fn pg_connect_url(amx_ptr: *mut Amx, params: *mut Cell) -> Cel
     spawn_connect(url, callback)
 }
 
-fn spawn_connect(config: String, callback: String) -> Cell {
+fn spawn_connect(conn_str: String, callback: String) -> Cell {
     let conn_id = handles::next_connection_id();
-    {
-        let mut conns = CONNECTIONS.lock().unwrap();
-        conns.insert(conn_id, PgConnection::new(conn_id));
+    if let Err(msg) = try_register_connection(conn_id, config::max_connections()) {
+        logprintf(&format!("[PGStream] {}", msg));
+        runtime::send_completion(CompletionEvent::Connected {
+            conn_id,
+            success: false,
+            callback,
+        });
+        return conn_id;
     }
 
     runtime::spawn(async move {
-        // Choose TLS mode: verify-full/verify-ca use validated, everything else uses novalidate
-        let use_verified = config.contains("sslmode=verify-full")
-            || config.contains("sslmode=verify-ca");
-        let tls = if use_verified {
-            make_tls_connector_verified()
-        } else {
-            make_tls_connector_novalidate()
+        let fallback = config::default_sslmode_value();
+        let resolved = config::resolve_ssl_mode(&conn_str, &fallback);
+        let mut pg_cfg = match tokio_postgres::Config::from_str(&resolved.conn) {
+            Ok(c) => c,
+            Err(e) => {
+                fail_connect(
+                    conn_id,
+                    &callback,
+                    &format!("Invalid connection config: {}", e),
+                );
+                return;
+            }
         };
-        match tokio_postgres::connect(&config, tls).await {
+        pg_cfg.connect_timeout(config::connect_timeout());
+
+        if resolved.mode == config::TlsMode::NoValidate {
+            logprintf(&format!(
+                "[PGStream] WARN: TLS tanpa verifikasi sertifikat (sslmode={}). Untuk produksi pakai sslmode=verify-full.",
+                resolved.sslmode
+            ));
+        }
+
+        let tls = match resolved.mode {
+            config::TlsMode::Verified => make_tls_connector_verified(),
+            _ => make_tls_connector_novalidate(),
+        };
+
+        match pg_cfg.connect(tls).await {
             Ok((client, connection)) => {
                 // Spawn connection handler that processes notifications via Stream
                 let cid = conn_id;
@@ -550,20 +728,7 @@ fn spawn_connect(config: String, callback: String) -> Cell {
                 });
             }
             Err(e) => {
-                let err_msg = e.to_string();
-                logprintf(&format!("[PGStream] Connect failed: {}", err_msg));
-                {
-                    let mut conns = CONNECTIONS.lock().unwrap();
-                    if let Some(c) = conns.get_mut(&conn_id) {
-                        c.status = ConnectionStatus::Failed;
-                        c.last_error = Some(err_msg);
-                    }
-                }
-                runtime::send_completion(CompletionEvent::Connected {
-                    conn_id,
-                    success: false,
-                    callback,
-                });
+                fail_connect(conn_id, &callback, &e.to_string());
             }
         }
     });
@@ -573,7 +738,9 @@ fn spawn_connect(config: String, callback: String) -> Cell {
 
 /// native PG_Close(connection);
 unsafe extern "C" fn pg_close(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(conn_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(conn_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let mut conns = CONNECTIONS.lock().unwrap();
     if let Some(mut c) = conns.remove(&conn_id) {
         c.status = ConnectionStatus::Disconnected;
@@ -586,7 +753,9 @@ unsafe extern "C" fn pg_close(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
 
 /// native bool:PG_IsConnected(connection);
 unsafe extern "C" fn pg_is_connected(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(conn_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(conn_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let conns = CONNECTIONS.lock().unwrap();
     match conns.get(&conn_id) {
         Some(c) if c.status == ConnectionStatus::Connected => 1,
@@ -600,7 +769,9 @@ unsafe extern "C" fn pg_is_connected(_amx_ptr: *mut Amx, params: *mut Cell) -> C
 
 /// native PG_AsyncQuery(connection, const query[], const callback[] = "", const format[] = "", ...);
 unsafe extern "C" fn pg_async_query(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(conn_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(conn_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let query_str = read_string_arg(amx_ptr, params, 2).unwrap_or_default();
     let callback = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
     let format = read_string_arg(amx_ptr, params, 4).unwrap_or_default();
@@ -659,9 +830,13 @@ unsafe extern "C" fn pg_rollback(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
 }
 
 unsafe fn tx_command(amx_ptr: *mut Amx, params: *mut Cell, sql: &str) -> Cell {
-    let Some(conn_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(conn_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let callback = read_string_arg(amx_ptr, params, 2).unwrap_or_default();
-    let Some(client) = get_client_arc(conn_id) else { return 0; };
+    let Some(client) = get_client_arc(conn_id) else {
+        return 0;
+    };
 
     let sql_owned = sql.to_string();
     runtime::spawn(async move {
@@ -688,10 +863,14 @@ unsafe fn tx_command(amx_ptr: *mut Amx, params: *mut Cell, sql: &str) -> Cell {
 
 /// native PG_Listen(connection, const channel[], const callback[] = "");
 unsafe extern "C" fn pg_listen(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(conn_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(conn_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let channel = read_string_arg(amx_ptr, params, 2).unwrap_or_default();
     let callback = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
-    let Some(client) = get_client_arc(conn_id) else { return 0; };
+    let Some(client) = get_client_arc(conn_id) else {
+        return 0;
+    };
 
     runtime::spawn(async move {
         let lock = client.lock().await;
@@ -721,10 +900,14 @@ unsafe extern "C" fn pg_listen(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
 
 /// native PG_Notify(connection, const channel[], const payload[] = "");
 unsafe extern "C" fn pg_notify(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(conn_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(conn_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let channel = read_string_arg(amx_ptr, params, 2).unwrap_or_default();
     let payload = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
-    let Some(client) = get_client_arc(conn_id) else { return 0; };
+    let Some(client) = get_client_arc(conn_id) else {
+        return 0;
+    };
 
     runtime::spawn(async move {
         let lock = client.lock().await;
@@ -749,11 +932,15 @@ unsafe extern "C" fn pg_notify(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
 
 /// native PG_Prepare(connection, const stmt_name[], const query[], const callback[] = "");
 unsafe extern "C" fn pg_prepare(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(conn_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(conn_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let stmt_name = read_string_arg(amx_ptr, params, 2).unwrap_or_default();
     let query = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
     let callback = read_string_arg(amx_ptr, params, 4).unwrap_or_default();
-    let Some(client) = get_client_arc(conn_id) else { return 0; };
+    let Some(client) = get_client_arc(conn_id) else {
+        return 0;
+    };
 
     runtime::spawn(async move {
         let lock = client.lock().await;
@@ -778,10 +965,7 @@ unsafe extern "C" fn pg_prepare(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
                 }
             }
             Err(e) => {
-                logprintf(&format!(
-                    "[PGStream] Prepare '{}' failed: {}",
-                    stmt_name, e
-                ));
+                logprintf(&format!("[PGStream] Prepare '{}' failed: {}", stmt_name, e));
                 {
                     let mut conns = CONNECTIONS.lock().unwrap();
                     if let Some(c) = conns.get_mut(&conn_id) {
@@ -803,7 +987,9 @@ unsafe extern "C" fn pg_prepare(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
 
 /// native PG_ExecutePrepared(connection, const stmt_name[], const callback[] = "", const format[] = "", ...);
 unsafe extern "C" fn pg_execute_prepared(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(conn_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(conn_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let stmt_name = read_string_arg(amx_ptr, params, 2).unwrap_or_default();
     let callback = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
     let format = read_string_arg(amx_ptr, params, 4).unwrap_or_default();
@@ -840,39 +1026,7 @@ unsafe extern "C" fn pg_execute_prepared(amx_ptr: *mut Amx, params: *mut Cell) -
 
     runtime::spawn(async move {
         let lock = client.lock().await;
-
-        let params_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = sql_params
-            .iter()
-            .map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
-        let res = match lock.query(&stmt, &params_refs[..]).await {
-            Ok(rows) => {
-                let mut cols = Vec::new();
-                if let Some(first) = rows.first() {
-                    for col in first.columns() {
-                        cols.push(col.name().to_string());
-                    }
-                }
-                let mut data_rows = Vec::new();
-                for row in rows.iter() {
-                    let mut r = Vec::new();
-                    for (i, _) in row.columns().iter().enumerate() {
-                        r.push(column_value(row, i));
-                    }
-                    data_rows.push(r);
-                }
-                let len = data_rows.len() as u64;
-                QueryResult::new(cols, data_rows, len)
-            }
-            Err(e) => {
-                if let Ok(affected) = lock.execute(&stmt, &params_refs[..]).await {
-                    QueryResult::empty_success(affected)
-                } else {
-                    QueryResult::error(e.to_string())
-                }
-            }
-        };
+        let res = execute_query_internal(&lock, &stmt, &sql_params).await;
 
         {
             let mut results = RESULTS.lock().unwrap();
@@ -895,25 +1049,42 @@ unsafe extern "C" fn pg_execute_prepared(amx_ptr: *mut Amx, params: *mut Cell) -
 // ---------------------------------------------------------------------------
 
 unsafe extern "C" fn pg_num_rows(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(result_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(result_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let res_map = RESULTS.lock().unwrap();
-    res_map.get(&result_id).map(|r| r.rows.len() as Cell).unwrap_or(0)
+    res_map
+        .get(&result_id)
+        .map(|r| r.rows.len() as Cell)
+        .unwrap_or(0)
 }
 
 unsafe extern "C" fn pg_num_fields(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(result_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(result_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let res_map = RESULTS.lock().unwrap();
-    res_map.get(&result_id).map(|r| r.columns.len() as Cell).unwrap_or(0)
+    res_map
+        .get(&result_id)
+        .map(|r| r.columns.len() as Cell)
+        .unwrap_or(0)
 }
 
 unsafe extern "C" fn pg_get_affected_rows(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(result_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(result_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let res_map = RESULTS.lock().unwrap();
-    res_map.get(&result_id).map(|r| r.rows_affected as Cell).unwrap_or(0)
+    res_map
+        .get(&result_id)
+        .map(|r| r.rows_affected as Cell)
+        .unwrap_or(0)
 }
 
 unsafe extern "C" fn pg_get_string(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(result_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(result_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let row = amx::native_arg(params, 2).unwrap_or(0) as usize;
     let col = amx::native_arg(params, 3).unwrap_or(0) as usize;
     let res_map = RESULTS.lock().unwrap();
@@ -925,7 +1096,9 @@ unsafe extern "C" fn pg_get_string(amx_ptr: *mut Amx, params: *mut Cell) -> Cell
 }
 
 unsafe extern "C" fn pg_get_int(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(result_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(result_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let row = amx::native_arg(params, 2).unwrap_or(0) as usize;
     let col = amx::native_arg(params, 3).unwrap_or(0) as usize;
     let res_map = RESULTS.lock().unwrap();
@@ -937,7 +1110,9 @@ unsafe extern "C" fn pg_get_int(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
 }
 
 unsafe extern "C" fn pg_get_float(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(result_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(result_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let row = amx::native_arg(params, 2).unwrap_or(0) as usize;
     let col = amx::native_arg(params, 3).unwrap_or(0) as usize;
     let res_map = RESULTS.lock().unwrap();
@@ -950,7 +1125,9 @@ unsafe extern "C" fn pg_get_float(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell
 }
 
 unsafe extern "C" fn pg_is_null(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(result_id) = amx::native_arg(params, 1) else { return 1; };
+    let Some(result_id) = amx::native_arg(params, 1) else {
+        return 1;
+    };
     let row = amx::native_arg(params, 2).unwrap_or(0) as usize;
     let col = amx::native_arg(params, 3).unwrap_or(0) as usize;
     let res_map = RESULTS.lock().unwrap();
@@ -966,7 +1143,9 @@ unsafe extern "C" fn pg_is_null(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
 }
 
 unsafe extern "C" fn pg_field_name(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(result_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(result_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let col = amx::native_arg(params, 2).unwrap_or(0) as usize;
     let res_map = RESULTS.lock().unwrap();
     let name = res_map
@@ -978,11 +1157,15 @@ unsafe extern "C" fn pg_field_name(amx_ptr: *mut Amx, params: *mut Cell) -> Cell
 }
 
 unsafe extern "C" fn pg_get_string_by_name(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(result_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(result_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let row = amx::native_arg(params, 2).unwrap_or(0) as usize;
     let col_name = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
     let res_map = RESULTS.lock().unwrap();
-    let col_idx = res_map.get(&result_id).and_then(|r| r.get_col_index(&col_name));
+    let col_idx = res_map
+        .get(&result_id)
+        .and_then(|r| r.get_col_index(&col_name));
     let text = match col_idx {
         Some(idx) => res_map
             .get(&result_id)
@@ -994,11 +1177,15 @@ unsafe extern "C" fn pg_get_string_by_name(amx_ptr: *mut Amx, params: *mut Cell)
 }
 
 unsafe extern "C" fn pg_get_int_by_name(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(result_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(result_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let row = amx::native_arg(params, 2).unwrap_or(0) as usize;
     let col_name = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
     let res_map = RESULTS.lock().unwrap();
-    let col_idx = res_map.get(&result_id).and_then(|r| r.get_col_index(&col_name));
+    let col_idx = res_map
+        .get(&result_id)
+        .and_then(|r| r.get_col_index(&col_name));
     match col_idx {
         Some(idx) => res_map
             .get(&result_id)
@@ -1010,11 +1197,15 @@ unsafe extern "C" fn pg_get_int_by_name(amx_ptr: *mut Amx, params: *mut Cell) ->
 }
 
 unsafe extern "C" fn pg_get_float_by_name(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(result_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(result_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let row = amx::native_arg(params, 2).unwrap_or(0) as usize;
     let col_name = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
     let res_map = RESULTS.lock().unwrap();
-    let col_idx = res_map.get(&result_id).and_then(|r| r.get_col_index(&col_name));
+    let col_idx = res_map
+        .get(&result_id)
+        .and_then(|r| r.get_col_index(&col_name));
     let f = match col_idx {
         Some(idx) => res_map
             .get(&result_id)
@@ -1027,11 +1218,15 @@ unsafe extern "C" fn pg_get_float_by_name(amx_ptr: *mut Amx, params: *mut Cell) 
 }
 
 unsafe extern "C" fn pg_is_null_by_name(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(result_id) = amx::native_arg(params, 1) else { return 1; };
+    let Some(result_id) = amx::native_arg(params, 1) else {
+        return 1;
+    };
     let row = amx::native_arg(params, 2).unwrap_or(0) as usize;
     let col_name = read_string_arg(amx_ptr, params, 3).unwrap_or_default();
     let res_map = RESULTS.lock().unwrap();
-    let col_idx = res_map.get(&result_id).and_then(|r| r.get_col_index(&col_name));
+    let col_idx = res_map
+        .get(&result_id)
+        .and_then(|r| r.get_col_index(&col_name));
     match col_idx {
         Some(idx) => {
             if res_map
@@ -1049,12 +1244,20 @@ unsafe extern "C" fn pg_is_null_by_name(amx_ptr: *mut Amx, params: *mut Cell) ->
 }
 
 unsafe extern "C" fn pg_free_result(_amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(result_id) = amx::native_arg(params, 1) else { return 0; };
-    if handles::free_result(result_id) { 1 } else { 0 }
+    let Some(result_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
+    if handles::free_result(result_id) {
+        1
+    } else {
+        0
+    }
 }
 
 unsafe extern "C" fn pg_get_error(amx_ptr: *mut Amx, params: *mut Cell) -> Cell {
-    let Some(conn_id) = amx::native_arg(params, 1) else { return 0; };
+    let Some(conn_id) = amx::native_arg(params, 1) else {
+        return 0;
+    };
     let conns = CONNECTIONS.lock().unwrap();
     let err = conns
         .get(&conn_id)
@@ -1091,15 +1294,18 @@ mod tests {
 
         // Row::try_get dispatches on Type::accepts: text rejects temporal types.
         assert!(!<String as FromSql>::accepts(&Type::TIMESTAMPTZ));
-        assert!(<chrono::DateTime<chrono::Utc> as FromSql>::accepts(&Type::TIMESTAMPTZ));
-        assert!(<chrono::NaiveDateTime as FromSql>::accepts(&Type::TIMESTAMP));
+        assert!(<chrono::DateTime<chrono::Utc> as FromSql>::accepts(
+            &Type::TIMESTAMPTZ
+        ));
+        assert!(<chrono::NaiveDateTime as FromSql>::accepts(
+            &Type::TIMESTAMP
+        ));
         assert!(<chrono::NaiveDate as FromSql>::accepts(&Type::DATE));
         assert!(<chrono::NaiveTime as FromSql>::accepts(&Type::TIME));
 
         let tz = <chrono::DateTime<chrono::Utc> as FromSql>::from_sql(&Type::TIMESTAMPTZ, &ts_raw)
             .unwrap();
-        let ts =
-            <chrono::NaiveDateTime as FromSql>::from_sql(&Type::TIMESTAMP, &ts_raw).unwrap();
+        let ts = <chrono::NaiveDateTime as FromSql>::from_sql(&Type::TIMESTAMP, &ts_raw).unwrap();
         let date = <chrono::NaiveDate as FromSql>::from_sql(&Type::DATE, &date_raw).unwrap();
         let time = <chrono::NaiveTime as FromSql>::from_sql(&Type::TIME, &time_raw).unwrap();
 

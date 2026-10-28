@@ -1,5 +1,5 @@
-use std::error::Error;
 use bytes::BytesMut;
+use std::error::Error;
 use tokio_postgres::types::{to_sql_checked, IsNull, ToSql, Type};
 
 #[derive(Debug, Clone)]
@@ -12,7 +12,11 @@ pub enum SqlParam {
 }
 
 impl ToSql for SqlParam {
-    fn to_sql(&self, ty: &Type, out: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
         match self {
             SqlParam::Int(val) => (*val).to_sql(ty, out),
             SqlParam::Float(val) => (*val).to_sql(ty, out),

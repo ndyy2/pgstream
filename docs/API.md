@@ -36,7 +36,13 @@ printf("PGStream %d ('%s')", code, version);
 native PG_Connect(const host[], const user[], const password[], const database[], port = 5432, const callback[] = "");
 ```
 
-Koneksi **tanpa TLS** dengan parameter individual. Return connection handle (integer ≥ 0) atau `-1` saat gagal menyiapkan koneksi. Hasil koneksi sebenarnya dikirim ke `callback` (async):
+Koneksi dengan parameter individual (bentuk key-value). Perilaku TLS ditentukan oleh field `sslmode` di `pgstream.toml` (`[database]`, default `require`) — parameter TLS tidak bisa di-set per-panggilan:
+
+- `sslmode=verify-ca` / `verify-full` — sertifikat diverifikasi (root store `webpki-roots` + hostname check).
+- `sslmode=require` / `prefer` — terenkripsi **tanpa** verifikasi sertifikat (rawan MITM); plugin memlog warning sekali per koneksi. Produksi wajib `verify-full`.
+- `sslmode=disable` — tanpa TLS.
+
+Return connection handle (integer ≥ 0) atau `-1` saat gagal menyiapkan koneksi. Hasil koneksi sebenarnya dikirim ke `callback` (async):
 
 - Callback signature: `forward <name>(connection, bool:success);`
 - Pada `success=false`, ambi detail lewat `PG_GetError`.
@@ -52,10 +58,14 @@ g_conn = PG_Connect("127.0.0.1", "postgres", "secret", "samp_db", 5432, "OnDBCon
 native PG_ConnectUrl(const url[], const callback[] = "");
 ```
 
-Koneksi lewat PostgreSQL URL. Jika URL memuat `sslmode=`, koneksi otomatis TLS sesuai mode:
+Koneksi lewat PostgreSQL URL. Semua mode `sslmode` didukung:
 
-- `sslmode=require` — encrypted, tapi **tanpa verifikasi sertifikat** (lihat README, Batasan).
-- `sslmode=verify-ca` / `verify-full` — sertifikat diverifikasi dengan root store penuh (webpki-roots).
+- `sslmode=disable` — tanpa TLS.
+- `sslmode=prefer` — terenkripsi, **tanpa verifikasi sertifikat** (perilaku sama dengan `require` di PGStream).
+- `sslmode=require` — terenkripsi, **tanpa verifikasi sertifikat** (rawan MITM; lihat README bagian TLS / sslmode).
+- `sslmode=verify-ca` / `sslmode=verify-full` — sertifikat diverifikasi (root store `webpki-roots` + hostname check). Produksi wajib `verify-full`.
+
+Jika `sslmode=` tidak ada atau kosong di URL, nilai `database.sslmode` di `pgstream.toml` (default `require`) dipakai sebagai fallback. Nilai yang tidak dikenal → koneksi ditolak (fail-closed).
 
 Gunakan placeholder, contoh:
 
@@ -98,6 +108,12 @@ native PG_GetError(connection, dest[], size = sizeof(dest));
 
 Mengisi `dest` dengan pesan error terakhir untuk koneksi. Dipanggil dari callback ketika `success=false`, atau query error.
 
+### Error umum
+
+- **`Max connections reached (N)`** — `N` = `pool.max_size` di `pgstream.toml`. Terjadi saat jumlah koneksi aktif (`Connecting`/`Connected`) sudah mencapai batas; koneksi baru ditolak (callback koneksi terpanggil dengan `success=0`; error terbaca via `PG_GetError`). Catatan: `max_size` adalah batas koneksi hidup, bukan ukuran pool idle.
+- **`Query timed out after Ns`** — `N` = `database.query_timeout_seconds`. Query melebihi timeout; callback query tetap terpanggil dengan `result` berisi error (teks error ada di `result.error` internal — belum ada native untuk membacanya; `PG_GetError` hanya menampilkan error level koneksi). Tetap panggil `PG_FreeResult(result)`.
+- Koneksi yang melebihi `database.connect_timeout_seconds` gagal; detailnya terbaca via `PG_GetError` di callback koneksi.
+
 ## PG_EscapeString
 
 ```pawn
@@ -136,7 +152,7 @@ PG_AsyncQuery(g_conn,
 );
 ```
 
-Catatan error: kalau query gagal SQL-nya, tetap invoke callback dengan `result` yang berisi error; baca `PG_GetError`. Selalu panggil `PG_FreeResult(result)` setelah selesai membaca.
+Catatan error: kalau query gagal SQL-nya, callback tetap terpanggil dengan `result` yang berisi error — teks error ada di `result.error` (internal); `PG_GetError` tidak menampilkan error level query. Selalu panggil `PG_FreeResult(result)` setelah selesai membaca.
 
 ## PG_Begin / PG_Commit / PG_Rollback
 

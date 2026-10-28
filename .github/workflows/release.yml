@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable) + mingw targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-pc-windows-gnu
+          components: rustfmt, clippy
+
+      - name: Install MinGW cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-i686 g++-mingw-w64-i686
+
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ./target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Cross-build Windows DLL (PE32 x86)
+        run: cargo build --target i686-pc-windows-gnu --release
+
+      - name: Verify DLL exists
+        run: test -f target/i686-pc-windows-gnu/release/pgstream.dll
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        run: |
+          NOTES="$(awk 'BEGIN{s=0} /^## \[/{if(s) exit; s=1} s{print}' CHANGELOG.md | head -n 40)"
+          echo "notes<<PGSTREAM_EOF" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$NOTES" >> "$GITHUB_OUTPUT"
+          echo "PGSTREAM_EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NOTES: ${{ steps.notes.outputs.notes }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          FILES=(
+            target/i686-pc-windows-gnu/release/pgstream.dll
+            pawn/include/pgstream.inc
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber "${FILES[@]}"
+          else
+            gh release create "$TAG" --title "Release ${TAG}" --notes "${NOTES}" "${FILES[@]}"
+          fi
